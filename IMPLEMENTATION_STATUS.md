@@ -1,9 +1,9 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 7: Analysis boundary (implemented).
+- Phase 8: Sequencer state machine (implemented).
 
-## Phase 1-7 Implementation Summary
+## Phase 1-8 Implementation Summary
 - Phase 1: Domain model, errors, clock, config with locked defaults
 - Phase 2: HAL base contracts and protocol tests
 - Phase 3: GPIO simulator, SafeOff aggregation, safety layer tests
@@ -11,6 +11,7 @@
 - Phase 5: Recorder/resume with crash-safe commit order and orphan cleanup
 - Phase 6: HSV LED classification, temporal window, and charging-gate polling
 - Phase 7: Versioned analysis boundary, burst-envelope trip time, sanity checks
+- Phase 8: Explicit sequencer state machine with retry/degrade/halt orchestration
 
 ## Locked values set
 - `gpio_k1=17`, `gpio_k2=27`, `gpio_k3=22`
@@ -35,9 +36,10 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (150 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (160 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_analysis.py'` (67 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_classify.py'` (45 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_sequencer.py'` (10 tests)
 - Failing: none in any phase
 
 ## Hardware-dependent items not executed
@@ -194,7 +196,32 @@
 - Adding the `analysis:` section to the canonical hash changes config hashes computed before
   Phase 7; no committed hash constants existed, so no stored run is invalidated.
 
-## Remaining work after Phase 7
-- Phase 8+: Sequencer state machine (including the three-way vision-timeout branch and the
-  extended-cooldown retry path), `tools/replay_waveform.py` offline re-analysis CLI,
-  real HALs, deployment
+## Implemented in Phase 8
+- Explicit state machine sequencer in [sequencer.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/sequencer.py)
+  with state transition logging (`SAFE_OFF` through `COMPLETE`)
+- Sequencer integration tests in [test_sequencer.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_sequencer.py)
+  covering normal, retry, degraded, and halt branches
+
+## Phase 8 sequencer behaviors covered
+- Required sequence enforced: mains close -> charging gate -> scope configure/arm/poll ->
+  K3 injection -> acquisition poll -> K3 open/backstop -> transfer -> analysis -> commit ->
+  mains open -> cooldown
+- Vision timeout branch handling:
+  - red timeout -> one retry with `cooldown_retry_s`; successful recovery logs `latch_slow_clear`
+  - blue timeout -> immediate HALT (no retry)
+  - off/unknown timeout -> immediate HALT (no retry)
+  - camera unavailable -> degraded fixed wait and continue
+- Distinguishes rig and DUT terminal outcomes:
+  - scope never triggered/acquisition timeout -> `RIG_FAULT`
+  - pre-trigger current sanity failure -> `RIG_FAULT`
+  - no-trip verdict -> `NO_TRIP` with sticky halt reason
+- K3 hard backstop honored by opening K3 at `k3_backstop_s` even if acquisition completion has not yet been observed
+- Every failure path de-energizes via `safe_off` and preserves K3 -> K2 -> K1 open ordering at the HAL layer
+- Commits per-cycle artifacts/CSV/runstate through [recorder.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/recorder.py)
+  and persists sticky halt reason when stopping
+
+## Remaining work after Phase 8
+- Phase 9: real HAL implementations (`gpio_real.py`, `scope_real.py`, `camera_real.py`)
+- Phase 10: CLI/lifecycle/monitoring/deployment (`main.py`, service + udev assets)
+- Phase 11: commissioning and replay tools (`gpio_selftest.py`, `scope_bench.py`,
+  `calibrate_camera.py`, `simulate.py`, `replay_waveform.py`)
