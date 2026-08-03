@@ -1,7 +1,7 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 3: Simulation-first safety layer (implemented).
+- Phase 4: Scope and camera simulators (implemented).
 
 ## Implemented in this phase
 - Domain enums/value objects in [states.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/states.py)
@@ -34,7 +34,7 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (21 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (31 tests)
 - Failing: none in this phase
 
 ## Hardware-dependent items not executed
@@ -70,5 +70,25 @@
 - Idempotent SafeOff routine attempting K3 -> K2 -> K1 even under errors
 - Aggregated SafeOff error reporting across all failed open steps
 
-## Remaining work after Phase 3
-- Phase 4+ (scope/camera simulators, recorder/resume, classify, analysis boundary, sequencer, real HALs, deployment)
+## Implemented in Phase 4
+- Deterministic scope simulator in [scope_sim.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/scope_sim.py)
+- Replay-or-fixture camera simulator in [camera_sim.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/camera_sim.py)
+- HAL exports updated in [__init__.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/__init__.py)
+- Scope simulator tests in [test_scope_sim.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_scope_sim.py)
+- Camera simulator tests in [test_camera_sim.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_camera_sim.py)
+
+## Phase 4 simulator behaviors covered
+- 120 V-equivalent 60 Hz burst synthesis with configurable phase and trip/no-trip behavior
+- 20 ms pre-trigger model and optional pre-trigger leakage injection
+- never-triggered case (acquisition never completes)
+- configurable arm/acquisition delays
+- injected communication errors by operation
+- truncated transfer fault mode
+- invalid/missing preamble field fault modes
+- configurable sample count and preamble metadata overrides
+- camera replay loading from file when available
+- deterministic fixture fallback explicitly marked as fixture source
+- camera unavailable/failed health path
+
+## Remaining work after Phase 4
+- Phase 5+ (recorder/resume semantics, classify, analysis boundary, sequencer, real HALs, deployment)
