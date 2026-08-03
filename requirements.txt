@@ -1,2 +1,7 @@
 PyYAML==6.0.2
 numpy>=1.26
+gpiozero==2.0.1
+pyvisa==1.14.1
+pyvisa-py==0.7.2
+pyusb==1.2.1
+opencv-python-headless==4.10.0.84

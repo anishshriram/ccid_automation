@@ -1,9 +1,9 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 8: Sequencer state machine (implemented).
+- Phase 9: Real HAL implementations (implemented).
 
-## Phase 1-8 Implementation Summary
+## Phase 1-9 Implementation Summary
 - Phase 1: Domain model, errors, clock, config with locked defaults
 - Phase 2: HAL base contracts and protocol tests
 - Phase 3: GPIO simulator, SafeOff aggregation, safety layer tests
@@ -12,6 +12,7 @@
 - Phase 6: HSV LED classification, temporal window, and charging-gate polling
 - Phase 7: Versioned analysis boundary, burst-envelope trip time, sanity checks
 - Phase 8: Explicit sequencer state machine with retry/degrade/halt orchestration
+- Phase 9: Real GPIO/scope/camera HAL modules with hardware-guarded tests
 
 ## Locked values set
 - `gpio_k1=17`, `gpio_k2=27`, `gpio_k3=22`
@@ -36,10 +37,13 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (160 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (167 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_analysis.py'` (67 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_classify.py'` (45 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_sequencer.py'` (10 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_gpio_real.py'` (3 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_scope_real.py'` (2 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_camera_real.py'` (2 tests)
 - Failing: none in any phase
 
 ## Hardware-dependent items not executed
@@ -221,7 +225,46 @@
   and persists sticky halt reason when stopping
 
 ## Remaining work after Phase 8
-- Phase 9: real HAL implementations (`gpio_real.py`, `scope_real.py`, `camera_real.py`)
+- Phase 10: CLI/lifecycle/monitoring/deployment (`main.py`, service + udev assets)
+- Phase 11: commissioning and replay tools (`gpio_selftest.py`, `scope_bench.py`,
+  `calibrate_camera.py`, `simulate.py`, `replay_waveform.py`)
+
+## Implemented in Phase 9
+- Real GPIO HAL in [gpio_real.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/gpio_real.py)
+  (`GpioRealContactorController`) using `gpiozero` digital outputs with the same
+  K3/K1/K2 interlocks as simulation and startup-safe outputs inactive
+- Real scope HAL in [scope_real.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/scope_real.py)
+  (`ScopeReal`) using PyVISA-compatible transport, explicit per-cycle config, run-bit
+  armed/acquisition polling, RAW BYTE waveform transfer, full preamble query, PNG capture,
+  and bounded reconnect attempts
+- Real camera HAL in [camera_real.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/camera_real.py)
+  (`CameraReal`) with one bounded reader thread, stale/failure detection, bounded frame
+  buffer, and injected LED state classification callback
+- HAL exports updated in [__init__.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/__init__.py)
+  to expose real + sim implementations
+- Dependency pins updated in [requirements.txt](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/requirements.txt)
+  (`gpiozero`, `pyvisa`, `pyvisa-py`, `pyusb`, `opencv-python-headless`)
+
+## Phase 9 behaviors covered
+- Real GPIO path enforces:
+  - K3 close only when K1 and K2 are commanded closed
+  - K1/K2 open blocked while K3 is commanded closed
+  - single-use gate token per cycle
+  - mains commanded-state mismatch detection with stagger window
+- Real scope path enforces:
+  - explicit cycle configuration (no front-panel inheritance)
+  - `:SINGle` arming semantics
+  - polling via `:OPERegister:CONDition?` Run bit (no sleep-only synchronization)
+  - waveform + preamble + PNG capture bundle
+  - bounded reconnect attempts before raising HAL error
+- Real camera path enforces:
+  - single reader thread and bounded in-memory frame queue
+  - stale-frame vs failed-camera health distinction
+  - camera failure represented as `LedState.CAMERA_UNAVAILABLE`
+- New non-hardware tests validate logic and protocol behavior without claiming
+  electrical commissioning completion
+
+## Remaining work after Phase 9
 - Phase 10: CLI/lifecycle/monitoring/deployment (`main.py`, service + udev assets)
 - Phase 11: commissioning and replay tools (`gpio_selftest.py`, `scope_bench.py`,
   `calibrate_camera.py`, `simulate.py`, `replay_waveform.py`)
