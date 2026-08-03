@@ -13,6 +13,7 @@ from ccid.hal.base import (
     ScopeStatus,
     WaveformCapture,
 )
+from ccid.hal.gpio_sim import DeterministicCommandError, GpioSimContactorController, SimContactorEvent
 
 __all__ = [
     "CameraHealth",
@@ -26,5 +27,7 @@ __all__ = [
     "ScopeSettings",
     "ScopeStatus",
     "WaveformCapture",
+    "DeterministicCommandError",
+    "GpioSimContactorController",
+    "SimContactorEvent",
 ]
-

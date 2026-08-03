@@ -1,7 +1,7 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 2: HAL contracts (implemented).
+- Phase 3: Simulation-first safety layer (implemented).
 
 ## Implemented in this phase
 - Domain enums/value objects in [states.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/states.py)
@@ -34,7 +34,7 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (14 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (21 tests)
 - Failing: none in this phase
 
 ## Hardware-dependent items not executed
@@ -54,5 +54,21 @@
 - Timestamped camera frame and camera-health state
 - Notification + heartbeat abstraction
 
-## Remaining work after Phase 2
-- Phase 3+ (simulation-first safety layer, scope/camera simulators, recorder/resume, sequencer, real HALs, deployment)
+## Implemented in Phase 3
+- GPIO simulation controller in [gpio_sim.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/gpio_sim.py)
+- SafeOff aggregate failure handling in [safety.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/safety.py)
+- HAL exports updated in [__init__.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/hal/__init__.py)
+- Safety/interlock tests in [test_safety.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_safety.py)
+
+## Phase 3 safety behavior covered
+- K3 close blocked unless both K1 and K2 are commanded closed
+- K1/K2 open blocked while K3 is commanded closed
+- Single-use charging gate token per cycle for K3 close
+- Deterministic command-failure injection for simulator
+- Monotonic event logging for command attempts/successes
+- Mains mismatch detection with bounded stagger window
+- Idempotent SafeOff routine attempting K3 -> K2 -> K1 even under errors
+- Aggregated SafeOff error reporting across all failed open steps
+
+## Remaining work after Phase 3
+- Phase 4+ (scope/camera simulators, recorder/resume, classify, analysis boundary, sequencer, real HALs, deployment)
