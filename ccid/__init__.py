@@ -1,0 +1,2 @@
+"""CCID automation package."""
+
