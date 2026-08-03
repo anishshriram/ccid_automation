@@ -150,11 +150,6 @@ Recommended order if budget is tight:
 - User may ask to tweak commit messages before push.
 - Do not overstate hardware readiness: real hardware code exists, but hardware execution remains **NOT RUN - HARDWARE REQUIRED**.
 
-## Credit/budget context
-
-- User reported usage around `2249.8 / 3000` credits and wants to preserve about `500` for future edits.
-- If continuing, keep scope tight and prefer smaller subphase-style deliveries.
-
 ## Useful recent commits
 
 - `9646e6a` - add CLI lifecycle deployment assets and monitoring hooks
