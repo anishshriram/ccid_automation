@@ -1,0 +1,689 @@
+# CCID Automation Coding Agent Instructions
+
+## 1. Mission
+
+Implement the CCID endurance-test automation system described in `ccid_automation_handoff-2.md`.
+
+The handoff is the authoritative source for:
+
+- Electrical architecture and hardware assignments
+- Locked design decisions
+- Safety requirements and interlocks
+- Test sequence and verdict behavior
+- Scope, camera, persistence, recovery, monitoring, and commissioning requirements
+- Explicit non-goals and rejected alternatives
+
+This instruction file defines how to convert that design into code. It does not replace the handoff. Read the entire handoff before changing or creating files.
+
+## 2. Authority and conflict rules
+
+Use this precedence order:
+
+1. Safety-critical locked requirements in the handoff
+2. Latest revision notes and later clarifications in the handoff
+3. This coding instruction file
+4. Existing repository code and comments
+5. Agent assumptions
+
+If two statements conflict, prefer the statement from the newest revision or the more safety-conservative interpretation. Do not silently resolve a material conflict. Record it in `IMPLEMENTATION_QUESTIONS.md` with file/section references and continue only on work that does not depend on it.
+
+Known editorial inconsistencies in the handoff must be normalized as follows:
+
+- The final system has three contactors, not two.
+- K1 switches L1 mains, K2 switches L2 mains, and K3 switches leakage injection.
+- SafeOff means all three contactors are commanded open, in the order K3 first, then K2/K1.
+- The ZX-517 boards have no onboard flyback diode. This is confirmed, not an open question.
+- Preserve 1 Mpoint captures unless measured transfer time is tens of seconds and a later explicit decision changes it.
+- Many conditions halt the run. A DUT no-trip is not the only halting condition.
+- The final trip-time endpoint algorithm remains unresolved until the UL 2231-2 endpoint definition is established.
+
+Do not reinterpret rejected alternatives as implementation options.
+
+## 3. Non-negotiable boundaries
+
+- The user owns implementation decisions that are not already locked.
+- Do not invent campaign-level statistical acceptance criteria.
+- Do not automate the EV simulator spoof.
+- Do not phase-synchronize leakage injection.
+- Do not use the webcam as the trip-time detector.
+- Do not use oscilloscope built-in pulse-width measurements as the trip-time result.
+- Do not use `:DIGitize`; use `:SINGle` and poll for the armed state.
+- Do not use `time.sleep()` as instrument synchronization. Poll instrument state with monotonic deadlines.
+- Do not use wall-clock time for durations.
+- Do not reduce raw waveform retention to screenshots or verdicts.
+- Do not implement a definitive trip-time endpoint definition unless it has been explicitly resolved.
+- Do not bypass the HAL safety interlocks from the sequencer, CLI, tests, or commissioning tools.
+- Do not commit secrets, notification URLs, credentials, run data, or captured footage.
+
+## 4. Safety invariants
+
+Treat these as executable invariants, not comments:
+
+1. K3 may close only when K1 and K2 are both commanded closed and the charging gate has been granted for the current cycle.
+2. Neither K1 nor K2 may be commanded open while K3 is commanded closed.
+3. SafeOff opens K3 first, confirms its commanded state is open, and then opens K2 and K1.
+4. Every normal, exceptional, signal, timeout, and shutdown path invokes SafeOff through `try/finally` or an equally strong mechanism.
+5. K1 and K2 commanded states must match outside the configured, bounded `mains_stagger_ms` interval.
+6. A persistent K1/K2 commanded-state mismatch halts the run.
+7. The software tracks commanded state only. It must never describe K1/K2 as physically confirmed without auxiliary-contact or voltage readback.
+8. Pre-trigger current indicates K3 was conducting before its command and causes an immediate halt.
+9. K3 has a 300 ms software hard backstop. The backstop is not described as independent hardware protection.
+10. GPIO outputs initialize inactive and remain inactive during object construction, startup validation, resume inspection, and shutdown.
+11. Resume never energizes a contactor merely to inspect state.
+12. Monitoring, vision, and notifications must not become new unsafe actuator paths.
+
+Place the actuator interlocks in the lowest contactor-control layer shared by real and simulated GPIO implementations. The sequencer may duplicate checks for clarity but may not be the sole enforcement point.
+
+## 5. Required repository structure
+
+Use or converge on this structure:
+
+```text
+/opt/ccid/
+├── config.yaml
+├── ccid/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
+│   ├── errors.py
+│   ├── clock.py
+│   ├── states.py
+│   ├── hal/
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── gpio_real.py
+│   │   ├── gpio_sim.py
+│   │   ├── scope_real.py
+│   │   ├── scope_sim.py
+│   │   ├── camera_real.py
+│   │   └── camera_sim.py
+│   ├── safety.py
+│   ├── analysis.py
+│   ├── classify.py
+│   ├── sequencer.py
+│   └── recorder.py
+├── tools/
+│   ├── gpio_selftest.py
+│   ├── scope_bench.py
+│   ├── calibrate_camera.py
+│   ├── replay_waveform.py
+│   └── simulate.py
+├── tests/
+│   ├── test_config.py
+│   ├── test_analysis.py
+│   ├── test_classify.py
+│   ├── test_recorder.py
+│   ├── test_resume.py
+│   ├── test_scope_protocol.py
+│   ├── test_sequencer.py
+│   ├── test_safety.py
+│   └── test_faultmatrix.py
+├── deploy/
+│   ├── ccid.service
+│   ├── 99-keysight-usbtmc.rules
+│   └── README.md
+├── requirements.txt
+├── README.md
+├── IMPLEMENTATION_STATUS.md
+└── IMPLEMENTATION_QUESTIONS.md
+```
+
+If the existing repository differs, inspect it before restructuring. Preserve useful user work. Make small, reviewable changes rather than replacing the project wholesale.
+
+## 6. Development sequence
+
+Complete the work in the following phases. Each phase must leave the repository runnable and tested before moving to the next.
+
+### Phase 0: Repository assessment
+
+- Inspect the existing tree, configuration, tests, and Git history available to the agent.
+- Map existing files to the target architecture.
+- Identify reusable code, obsolete code, and safety-critical gaps.
+- Create or update `IMPLEMENTATION_STATUS.md` with:
+  - Existing functionality
+  - Missing functionality
+  - Current phase
+  - Tests passing/failing
+  - Hardware-dependent items not executed
+- Create `IMPLEMENTATION_QUESTIONS.md` only for material unresolved issues. Do not fill it with routine implementation choices.
+- Do not modify actuator code until the existing behavior is understood.
+
+Exit criterion: repository assessment is recorded and the project test command is known.
+
+### Phase 1: Domain model, errors, clock, and configuration
+
+Implement:
+
+- Enums and immutable result/value types in `states.py`
+- Explicit exception taxonomy in `errors.py`
+- UTC wall-time and monotonic-duration helpers in `clock.py`
+- Strict configuration loading, validation, canonicalization, and hashing in `config.py`
+- A complete example `config.yaml`
+
+Configuration validation must reject:
+
+- Reused GPIO numbers
+- Invalid or negative timeouts
+- `pass_limit_s >= no_trip_limit_s`
+- `k3_backstop_s <= no_trip_limit_s`
+- Unsupported scope or camera modes
+- Missing run/output paths
+- Invalid heartbeat grace values
+- Unknown keys, unless a documented forward-compatibility policy is deliberately implemented
+
+The canonical configuration hash must be stable across irrelevant YAML formatting and key order. Secrets should be injected through environment variables or a non-committed local configuration mechanism and must not be written into frozen run configuration in plaintext.
+
+Minimum locked values include:
+
+```yaml
+gpio_k1: 17
+gpio_k2: 27
+gpio_k3: 22
+cooldown_s: 10
+cooldown_retry_s: 60
+boot_timeout_s: 90
+scope_arm_timeout_s: <explicit value from specification>
+scope_acquisition_timeout_s: 5
+k3_backstop_s: 0.300
+pass_limit_s: 0.02497
+no_trip_limit_s: 0.100
+heartbeat_grace_s: 300
+mains_stagger_ms: 0
+```
+
+Do not guess a missing locked value. Put it in `IMPLEMENTATION_QUESTIONS.md` if the handoff and specification do not define it.
+
+Exit criterion: configuration and domain-model tests pass without hardware.
+
+### Phase 2: HAL contracts
+
+Define typed abstract interfaces or protocols in `ccid/hal/base.py` before implementing concrete classes.
+
+Contracts must cover:
+
+- Contactor commands and commanded-state inspection
+- Charging-gate authorization scoped to one cycle
+- Safe opening order
+- Scope connection, identity, configuration, readback, arm, armed polling, acquisition polling, preamble transfer, waveform transfer, and screenshot transfer
+- Timestamped camera frames and camera-health state
+- Notification and heartbeat interfaces if they are abstracted
+- Testable monotonic clock injection
+
+Use domain-level operations rather than exposing raw GPIO or arbitrary SCPI calls to the sequencer.
+
+Document for every method:
+
+- Preconditions
+- Postconditions
+- Exceptions
+- Timeout behavior
+- Whether it performs I/O
+- Whether it is safe to retry
+
+Exit criterion: contracts type-check and can be implemented by fakes without importing Raspberry Pi, VISA, or OpenCV libraries.
+
+### Phase 3: Simulation-first safety layer
+
+Implement `gpio_sim.py` and `safety.py` before real GPIO.
+
+The simulator must:
+
+- Enforce the same interlocks as real hardware
+- Record monotonic event timestamps
+- Support deterministic injected failures
+- Allow assertions about K3/K2/K1 opening order
+- Model command failures without claiming physical readback
+
+Implement an idempotent SafeOff routine that attempts all safe de-energization steps even if one command raises. Preserve and report all encountered errors without skipping later opening attempts.
+
+Write tests for every invariant before developing the sequencer.
+
+Exit criterion: safety tests prove forbidden transitions cannot be issued through the public HAL.
+
+### Phase 4: Scope and camera simulators
+
+Implement deterministic simulators suitable for unit and integration tests.
+
+`scope_sim.py` must support:
+
+- A 120 V, 60 Hz sine burst with configurable phase and trip time
+- A 20 ms pre-trigger interval
+- Normal trip, late trip, no-trip, and never-triggered cases
+- Pre-trigger leakage for K3 stuck-closed detection
+- Delayed arm and delayed completion
+- Communication errors
+- Truncated binary transfer
+- Invalid/missing preamble fields
+- Configurable sample count and scaling metadata
+
+`camera_sim.py` must replay recorded commissioning footage when available. Until footage exists, test fixtures may use deterministic frame sequences, but clearly label them as test fixtures rather than representative optical models.
+
+Exit criterion: simulators reproducibly drive all major fault branches.
+
+### Phase 5: Recorder and resume semantics
+
+Implement `recorder.py` before the full sequencer.
+
+Required per-cycle artifacts:
+
+- `waveforms/<n>.npz`
+- `images/<n>_scope.png`
+- `images/<n>_green.jpg`
+- `images/<n>_fault_<k>.jpg` when applicable
+- `cycles/<n>.json`
+- One row in `cycles.csv`
+
+The NPZ must contain raw samples and all waveform scaling metadata needed to reconstruct time and voltage. At minimum preserve x increment, x origin, x reference, y increment, y origin, y reference, format, points, and source channel.
+
+Minimum `cycles.csv` columns:
+
+```text
+cycle_index
+run_id
+utc_timestamp
+monotonic_start
+trip_time_s
+verdict
+analysis_version
+led_state_at_gate
+degraded_flags
+notes
+```
+
+`trip_time_s` is a raw, unrounded float in seconds or null. Verdict is separate.
+
+Commit order is mandatory:
+
+1. Write all per-cycle artifacts.
+2. Flush and fsync each artifact.
+3. Append and fsync the CSV row.
+4. Atomically write `runstate.json` using temp file, fsync, and `os.replace`.
+5. Send the external heartbeat.
+
+Resume behavior:
+
+- Reuse the same run ID and directory.
+- Validate the configuration hash.
+- Refuse automatic resume if `halt_reason` is non-null.
+- Delete or quarantine artifacts above `last_completed_cycle`.
+- Redo the uncommitted cycle.
+- Never mark a cycle complete before all required artifacts and the CSV row are durable.
+
+Write crash-injection tests between every commit step.
+
+Exit criterion: repeated simulated crashes cannot create a skipped cycle or a falsely completed cycle.
+
+### Phase 6: Vision classification
+
+Implement `classify.py` around a fixed ROI and HSV hue presence over an approximately three-second temporal window.
+
+Required classifications:
+
+- Multiple relevant hues: booting
+- Green present: charging
+- Red present: faulted
+- Blue without green/red: ready
+- No reliable LED: off/unknown
+- Frame source unavailable: camera unavailable
+
+Require configurable consecutive agreement before declaring a transition. Keep optical thresholds in configuration, not scattered constants. Ensure test fixtures cover exposure variation, sensor noise, dropped frames, and transitions.
+
+Vision may grant the charging gate. It may record red as secondary evidence after a trip. It must never calculate trip time.
+
+Exit criterion: deterministic tests cover all gate outcomes and camera degradation.
+
+### Phase 7: Analysis boundary and sanity checks
+
+Implement a versioned analysis interface without pretending the UL endpoint question is resolved.
+
+The initial implementation must support:
+
+- Conversion of raw ADC codes using the full waveform preamble
+- Time-axis reconstruction
+- Signal-present sanity validation
+- Pre-trigger-current detection
+- Detection that leakage persists through the no-trip threshold/window
+- A result object containing raw trip time or null, verdict, validity/confidence metadata, analysis version, and diagnostics
+
+The definitive envelope endpoint algorithm must be isolated behind a versioned strategy/interface. If an interim algorithm is needed for commissioning, label it explicitly as provisional and prevent it from being mistaken for the final qualification method.
+
+Boundary tests must include values immediately below, equal to, and immediately above 24.97 ms and 100 ms. Do not round before classification.
+
+Exit criterion: safety-relevant sanity checks work, and the unresolved endpoint convention remains replaceable without data-format migration.
+
+### Phase 8: Sequencer state machine
+
+Implement `sequencer.py` as an explicit state machine, not an ad hoc chain of nested conditionals.
+
+Minimum states:
+
+```text
+SAFE_OFF
+MAINS_CLOSING
+WAITING_FOR_CHARGING
+SCOPE_CONFIGURING
+SCOPE_ARMING
+SCOPE_ARMED
+INJECTING
+ACQUIRING
+INJECTION_OPENING
+TRANSFERRING
+COMMITTING
+MAINS_OPENING
+COOLDOWN
+RETRY_COOLDOWN
+DEGRADED_FIXED_WAIT
+HALTED
+COMPLETE
+```
+
+Required normal sequence:
+
+1. Begin from SafeOff.
+2. Command K1 and K2 closed within the configured stagger.
+3. Wait for blinking green/charging.
+4. Configure the scope explicitly.
+5. Issue `:SINGle`.
+6. Poll until the scope is armed.
+7. Grant the cycle-scoped charging gate and close K3.
+8. Poll for acquisition completion.
+9. Open K3 within the hard backstop.
+10. Transfer waveform, preamble, scope PNG, camera evidence, and scope-setting readback.
+11. Run inline sanity checks.
+12. Commit all artifacts and state.
+13. Open K2 and K1 only after K3 is commanded open.
+14. Apply the normal cooldown.
+
+Required vision timeout branches:
+
+- Blinking red: open safely, use one 60-second extended cooldown, retry once, log `latch_slow_clear` if recovery succeeds, halt if red persists.
+- Blue: halt immediately with no retry.
+- Off/no LED: halt immediately with no retry.
+- Camera unavailable: enter logged degraded mode, wait a fixed 60 seconds, and continue.
+
+Required acquisition branches:
+
+- Valid trip at or below 24.97 ms: PASS and continue.
+- Valid trip above 24.97 ms but below 100 ms: FAIL, alert, and continue.
+- Current continuing to or beyond 100 ms/no trip: halt as DUT no-trip.
+- Scope never triggers: halt as rig fault.
+- Pre-trigger current: halt as K3 stuck closed/driver short indication.
+- Persistent K1/K2 commanded mismatch: halt.
+
+All transitions must be logged with monotonic timestamps. Terminal fault records must identify whether the fault belongs to the DUT, rig, peripheral, persistence layer, or controller.
+
+Exit criterion: all normal, retry, degraded, and halt paths pass integration tests with simulated HALs.
+
+### Phase 9: Real hardware implementations
+
+Only after simulation and safety tests pass, implement the real HALs.
+
+#### Real GPIO
+
+- Use `gpiozero` with the `lgpio` backend.
+- Initialize outputs inactive.
+- Treat GPIO17 as K1, GPIO27 as K2, and GPIO22 as K3.
+- Reuse exactly the same interlock logic as simulation.
+- Do not claim physical contact state confirmation.
+
+#### Real scope
+
+Use PyVISA with the Pi-compatible backend and implement:
+
+- Identity verification
+- Full per-cycle configuration write
+- Full settings readback
+- `:SINGle`
+- Armed polling through the appropriate operation-condition Run bit
+- Five-second acquisition timeout
+- RAW/MAX BYTE waveform transfer
+- Complete preamble transfer
+- Scope PNG transfer
+- Up to three bounded reconnect attempts for communication drops
+- Strict distinction between never-triggered and triggered-no-trip
+
+Store and validate the configured VISA resource. Never inherit front-panel state.
+
+#### Real camera
+
+- Use one bounded reader thread.
+- Expose timestamped latest/recent frames safely.
+- Detect stale frames and reader failure.
+- Support fixed exposure and white-balance commissioning checks.
+- Avoid unbounded queues and memory growth during a multi-day run.
+
+No real-hardware test may be marked complete unless it was actually run on the target hardware. Use explicit `NOT RUN - HARDWARE REQUIRED` status rather than simulated success.
+
+Exit criterion: implementations import and unit-test off-target, and commissioning tools are ready for target execution.
+
+### Phase 10: CLI, lifecycle, monitoring, and deployment
+
+Implement `main.py` and deployment files.
+
+CLI must support at least:
+
+- Start a new run
+- Resume a run
+- Select real or simulated HAL through validated configuration
+- Explicit config-hash override
+- Simulation/fault-injection entry points located outside production defaults
+- Safe status/reporting commands that do not energize hardware
+
+Lifecycle requirements:
+
+- Install SIGINT/SIGTERM handlers.
+- Invoke SafeOff during all exits.
+- Keep halt sticky.
+- Do not automatically restart a halted campaign.
+- Send start, resume, fail, and completion notifications.
+- Send the healthchecks heartbeat only after a committed cycle.
+- Ignore/log outbound monitoring failures.
+- Feed the systemd watchdog independently of external heartbeat reachability.
+
+Provide:
+
+- Pinned `requirements.txt`
+- systemd service unit
+- udev rule for Keysight VID 0957/PID 1798
+- Deployment instructions for venv, permissions, watchdog, logging, and service operation
+- Secret-injection instructions
+
+Exit criterion: a full simulated campaign can run under the same CLI and lifecycle used by production.
+
+### Phase 11: Commissioning tools
+
+Implement tools as guarded, explicit utilities. They must default to de-energized hardware and require deliberate operator action for any output change.
+
+`gpio_selftest.py`:
+
+- Select one contactor explicitly.
+- Show BCM GPIO and physical pin.
+- Default all off.
+- Exercise transitions one at a time.
+- Provide a controlled mismatch-detector test.
+
+`scope_bench.py`:
+
+- Run `*IDN?`.
+- Display VISA backend/resource.
+- Apply and read back the complete scope configuration.
+- Verify arm polling.
+- Query available memory depth.
+- Time 1 Mpoint BYTE and PNG transfers.
+- Save and validate a bench capture.
+
+`calibrate_camera.py`:
+
+- Show/save ROI.
+- Record each LED state.
+- Calculate proposed HSV ranges.
+- Verify temporal classification.
+- Create replay footage for `camera_sim`.
+
+`simulate.py`:
+
+- Execute accelerated long runs.
+- Inject faults by cycle and state.
+- Inject crashes between persistence steps.
+- Verify resume, sticky halt, and opening-order behavior.
+
+`replay_waveform.py`:
+
+- Process one waveform, a cycle range, or a run.
+- Select an analysis version.
+- Never overwrite original raw data.
+- Produce auditable revised results and a change report.
+
+Exit criterion: each tool has `--help`, safe defaults, typed errors, and tests for non-hardware logic.
+
+## 7. Fault matrix implementation
+
+Encode every handoff fault as a parameterized test. At minimum include:
+
+- DUT no-trip at or beyond 100 ms
+- Late trip between 24.97 and 100 ms
+- Scope never triggered
+- K3 pre-trigger current/stuck-closed indication
+- Persistent K1/K2 commanded mismatch
+- K1/K2 physically stuck closed as an explicitly undetectable known gap
+- Healthcheck request failure
+- Missing external heartbeat as an external-service behavior, documented rather than falsely unit-tested locally
+- Red vision timeout with successful extended-cooldown retry
+- Red vision timeout with failed retry
+- Blue vision timeout
+- Off vision timeout
+- Scope communications drop and three reconnect attempts
+- Camera failure and degraded fixed wait
+- Disk below 2 GB
+- Script hang/watchdog behavior at the service boundary
+- Pi hang/hardware watchdog behavior as deployment validation
+- Power loss and safe resume semantics
+
+For each testable row assert:
+
+- Fault classification
+- Retry, degrade, continue, or halt decision
+- Notification behavior
+- Final commanded contactor states
+- Opening order
+- Runstate contents
+- Artifacts retained or rejected
+- Whether the next cycle is permitted
+
+Do not fake claims that kernel watchdog, electrical flyback protection, contact welding, or actual power-loss behavior were validated by an ordinary unit test.
+
+## 8. Testing standards
+
+- Use deterministic clocks and seeded randomness.
+- Avoid real sleeping in unit tests.
+- Use temporary directories for run data.
+- Parameterize boundary and fault cases.
+- Test public behavior, safety invariants, and durable outputs.
+- Use dependency injection for clock, GPIO, VISA transport, camera frames, filesystem fault injection where practical, notifications, and heartbeat transport.
+- Keep hardware tests separately marked so the default CI suite remains cross-platform.
+- Run formatting, linting, type checking, and tests after each phase.
+- Do not weaken tests to make implementation pass.
+- Every fixed bug requires a regression test.
+
+Recommended quality gates:
+
+```text
+formatter: clean
+linter: clean
+type checker: clean
+unit tests: pass
+simulation integration tests: pass
+hardware tests: explicitly pass or explicitly not run
+```
+
+Choose tools compatible with Python 3.11+ and pin their versions.
+
+## 9. Data and logging rules
+
+- Log state transitions, commands, responses needed for diagnosis, faults, retries, degraded modes, and persistence milestones.
+- Never log secrets or full heartbeat URLs.
+- Use UTC ISO 8601 timestamps for records and monotonic values for elapsed-time analysis.
+- Include run ID, cycle index, state, and fault category in structured log context.
+- Read scope settings back from the instrument and store actual values, not only requested values.
+- Preserve software version, config hash, and analysis version per cycle.
+- Keep raw data immutable after commit.
+- Any replayed analysis must be distinguishable from the original inline analysis.
+
+## 10. Code quality and architecture rules
+
+- Python 3.11+.
+- Prefer type hints throughout.
+- Keep hardware libraries out of abstract interfaces and domain modules.
+- Do not use global mutable actuator state.
+- Keep the sequencer single-threaded; only the camera reader gets a dedicated thread.
+- Avoid async unless an explicit new requirement justifies it.
+- Keep methods small enough that safety preconditions and cleanup are visible.
+- Use explicit named result objects instead of loosely structured dictionaries across module boundaries.
+- Centralize tunable values in configuration.
+- Centralize SCPI commands and expected readback parsing in the scope implementation.
+- Make retries bounded and observable.
+- Make cleanup idempotent.
+- Preserve exception causes when translating low-level errors into domain errors.
+
+## 11. Agent operating procedure
+
+For every coding iteration:
+
+1. Read the relevant handoff sections again.
+2. Inspect existing code before editing.
+3. State the narrow implementation goal in `IMPLEMENTATION_STATUS.md`.
+4. Write or update tests first for safety behavior and regressions.
+5. Implement the smallest coherent change.
+6. Run targeted tests.
+7. Run the full non-hardware test suite.
+8. Run formatting, linting, and type checking.
+9. Review the diff for accidental behavior changes, hard-coded values, secrets, and unsafe defaults.
+10. Update `IMPLEMENTATION_STATUS.md` with exact commands and outcomes.
+11. Commit in a small logical unit if the environment permits commits.
+
+Do not ask the user routine questions that can be answered from the handoff, repository, tests, or instrument abstraction. Ask only when a material requirement is genuinely unresolved and blocks safe implementation.
+
+## 12. Deliverable format after each phase
+
+Report:
+
+```text
+Phase completed:
+Files added/changed:
+Behavior implemented:
+Safety invariants covered:
+Tests added:
+Commands run:
+Results:
+Hardware tests not run:
+Open blockers:
+Next phase:
+```
+
+Do not claim the system is ready for mains operation or an unattended 6,000-cycle campaign solely because simulation passes.
+
+## 13. Definition of done for the coding effort
+
+The software implementation is complete only when:
+
+- All required modules and deployment files exist.
+- HAL contracts are implemented consistently by real and simulated backends.
+- Safety invariants are enforced below the sequencer.
+- Every fault-matrix row is tested where software testing is meaningful.
+- The full simulated 6,000-cycle campaign completes.
+- Crash injection proves commit/resume behavior.
+- Sticky halt behavior is verified.
+- Raw waveform, settings, preamble, images, JSON, CSV, and runstate outputs are correct.
+- Healthcheck failure cannot halt the campaign.
+- Camera failure degrades exactly as specified.
+- The unresolved trip endpoint convention remains versioned and replaceable.
+- Commissioning tools and procedures are ready.
+- Hardware-dependent checks are clearly marked and then completed during the six commissioning stages.
+- Stage 4 produces one fully hand-validated cycle.
+- Stage 5 passes 10 cycles and then 100 cycles, including forced process termination/resume, measured cycle time, latch-clear monitoring, strict opening-order verification, and dead-man alert verification.
+- Open hardware item 16, K1/K2 physical-state readback, is explicitly accepted or resolved before Stage 6.
+- No unresolved safety blocker remains before the full 6,000-cycle campaign.
+
+## 14. Final reminder
+
+This is safety-relevant test automation controlling mains contactors and intentional leakage-current injection. Software detection is not a substitute for the required physical ground bonding, flyback diodes, gate pulldowns, labeling, breakers, restricted access, and commissioning checks. Never present a software test as proof that the electrical assembly is safe.
