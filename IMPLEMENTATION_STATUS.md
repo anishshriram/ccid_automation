@@ -1,15 +1,14 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 4: Scope and camera simulators (implemented).
+- Phase 5: Recorder and resume semantics (implemented).
 
-## Implemented in this phase
-- Domain enums/value objects in [states.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/states.py)
-- Exception taxonomy in [errors.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/errors.py)
-- UTC + monotonic helpers in [clock.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/clock.py)
-- Strict config loading/validation/canonical hash in [config.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/config.py)
-- Example locked config in [config.yaml](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/config.yaml)
-- Phase 1 tests in [tests/](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests)
+## Phase 1-5 Implementation Summary
+- Phase 1: Domain model, errors, clock, config with locked defaults
+- Phase 2: HAL base contracts and protocol tests
+- Phase 3: GPIO simulator, SafeOff aggregation, safety layer tests
+- Phase 4: Deterministic scope and camera simulators with fault branches
+- Phase 5: Recorder/resume with crash-safe commit order and orphan cleanup
 
 ## Locked values set
 - `gpio_k1=17`, `gpio_k2=27`, `gpio_k3=22`
@@ -34,8 +33,8 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (31 tests)
-- Failing: none in this phase
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (38 tests)
+- Failing: none in any phase
 
 ## Hardware-dependent items not executed
 - Real GPIO/scope/camera behavior not executed
@@ -90,5 +89,23 @@
 - deterministic fixture fallback explicitly marked as fixture source
 - camera unavailable/failed health path
 
-## Remaining work after Phase 4
-- Phase 5+ (recorder/resume semantics, classify, analysis boundary, sequencer, real HALs, deployment)
+## Implemented in Phase 5
+- RunRecorder with crash-safe commit ordering in [recorder.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/recorder.py)
+- Extended exception taxonomy in [errors.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/errors.py) (PersistenceError, ResumeBlockedError, ConfigHashMismatchError)
+- Recorder tests in [test_recorder.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_recorder.py)
+- Crash-injection resume tests in [test_resume.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_resume.py)
+
+## Phase 5 persistence behaviors covered
+- Crash-safe commit ordering: artifacts (.npz, .png, .jpg, .json) → cycles.csv → atomic runstate.json → heartbeat
+- Orphan reconciliation on resume (deletes orphaned artifacts, truncates CSV to last completed cycle)
+- Config hash mismatch detection blocks resume with ResumeBlockedError
+- Atomic runstate.json writes (temp file + fsync + os.replace)
+- Heartbeat sent only after durable state achieved
+- CSV schema: cycle_index, run_id, utc_timestamp, monotonic_start, trip_time_s, verdict, analysis_version, led_state_at_gate, degraded_flags, notes
+- Deterministic crash injection points (before CSV flush, after CSV, before runstate)
+- All 38 unit tests passing
+
+## Remaining work after Phase 5
+- Phase 6: Vision classification (classify.py) - HSV-based LED state detection, await_charging_gate() polling
+- Phase 7: Analysis boundary (analysis.py) - Versioned analysis interface, sanity checks, burst envelope extraction
+- Phase 8+: Sequencer state machine, real HALs, deployment

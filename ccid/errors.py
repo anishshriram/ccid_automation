@@ -25,3 +25,14 @@ class SafetyViolationError(CcidError):
 class TimeoutError(CcidError):
     """Monotonic deadline expired."""
 
+
+class PersistenceError(CcidError):
+    """Artifact, CSV, or runstate persistence failure."""
+
+
+class ResumeBlockedError(CcidError):
+    """Resume is blocked because run state is sticky halted."""
+
+
+class ConfigHashMismatchError(CcidError):
+    """Resume config hash mismatch; explicit override required."""
