@@ -23,6 +23,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsInstance(config, AppConfig)
         self.assertEqual(config.gpio.k1, 17)
         self.assertEqual(config.timing.scope_arm_timeout_s, 2.0)
+        self.assertEqual(config.modes.gpio_mode, "sim")
 
     def test_rejects_duplicate_gpio(self) -> None:
         path = self._write_config(
@@ -40,7 +41,7 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
-            modes: {scope_mode: sim, camera_mode: sim}
+            modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {heartbeat_url_env: CCID_HEALTHCHECKS_URL}
             """
@@ -64,7 +65,7 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
-            modes: {scope_mode: sim, camera_mode: sim}
+            modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {heartbeat_url_env: CCID_HEALTHCHECKS_URL}
             """
@@ -88,7 +89,7 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
-            modes: {scope_mode: sim, camera_mode: sim}
+            modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {heartbeat_url_env: CCID_HEALTHCHECKS_URL}
             """
@@ -112,7 +113,7 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
-            modes: {scope_mode: sim, camera_mode: sim}
+            modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {heartbeat_url_env: CCID_HEALTHCHECKS_URL}
             """
@@ -125,6 +126,7 @@ class ConfigTests(unittest.TestCase):
               output_root: ./runs
               run_root: ./runs
             modes:
+              gpio_mode: sim
               camera_mode: sim
               scope_mode: sim
             timing:
@@ -165,7 +167,31 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
-            modes: {scope_mode: visa, camera_mode: sim}
+            modes: {gpio_mode: sim, scope_mode: visa, camera_mode: sim}
+            paths: {run_root: ./runs, output_root: ./runs}
+            monitoring: {heartbeat_url_env: CCID_HEALTHCHECKS_URL}
+            """
+        )
+        with self.assertRaises(ConfigValidationError):
+            load_config(path)
+
+    def test_rejects_unsupported_gpio_mode(self) -> None:
+        path = self._write_config(
+            """
+            schema_version: 1
+            gpio: {k1: 17, k2: 27, k3: 22}
+            timing:
+              cooldown_s: 10
+              cooldown_retry_s: 60
+              boot_timeout_s: 90
+              scope_arm_timeout_s: 2.0
+              scope_acquisition_timeout_s: 5
+              k3_backstop_s: 0.3
+              pass_limit_s: 0.02497
+              no_trip_limit_s: 0.1
+              heartbeat_grace_s: 300
+              mains_stagger_ms: 0
+            modes: {gpio_mode: visa, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {heartbeat_url_env: CCID_HEALTHCHECKS_URL}
             """
@@ -176,4 +202,3 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

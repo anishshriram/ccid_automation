@@ -1,0 +1,21 @@
+[Unit]
+Description=CCID endurance automation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+WorkingDirectory=/opt/ccid
+EnvironmentFile=-/etc/default/ccid-automation
+ExecStart=/opt/ccid/venv/bin/python -m ccid.main --config /opt/ccid/config.yaml resume --latest
+Restart=on-failure
+RestartSec=5
+WatchdogSec=10
+TimeoutStopSec=20
+User=ccid
+Group=ccid
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

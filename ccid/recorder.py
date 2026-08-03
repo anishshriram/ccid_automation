@@ -149,6 +149,9 @@ class RunRecorder:
             )
         return state
 
+    def read_run_state_unchecked(self, run_dir: Path) -> RunState:
+        return self._read_runstate(run_dir / "runstate.json")
+
     def reconcile_orphans(self, run_dir: Path, state: RunState) -> None:
         self._delete_orphans(run_dir, state.last_completed_cycle)
         self._truncate_cycles_csv(run_dir / "cycles.csv", state.last_completed_cycle)

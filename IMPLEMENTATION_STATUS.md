@@ -1,9 +1,9 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 9: Real HAL implementations (implemented).
+- Phase 10: CLI, lifecycle, monitoring, and deployment (implemented).
 
-## Phase 1-9 Implementation Summary
+## Phase 1-10 Implementation Summary
 - Phase 1: Domain model, errors, clock, config with locked defaults
 - Phase 2: HAL base contracts and protocol tests
 - Phase 3: GPIO simulator, SafeOff aggregation, safety layer tests
@@ -13,6 +13,7 @@
 - Phase 7: Versioned analysis boundary, burst-envelope trip time, sanity checks
 - Phase 8: Explicit sequencer state machine with retry/degrade/halt orchestration
 - Phase 9: Real GPIO/scope/camera HAL modules with hardware-guarded tests
+- Phase 10: CLI entry point, signal-safe lifecycle, status commands, watchdog/notification wiring, and deployment assets
 
 ## Locked values set
 - `gpio_k1=17`, `gpio_k2=27`, `gpio_k3=22`
@@ -37,13 +38,14 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (167 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (175 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_analysis.py'` (67 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_classify.py'` (45 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_sequencer.py'` (10 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_gpio_real.py'` (3 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_scope_real.py'` (2 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_camera_real.py'` (2 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_main.py'` (7 tests)
 - Failing: none in any phase
 
 ## Hardware-dependent items not executed
@@ -265,6 +267,43 @@
   electrical commissioning completion
 
 ## Remaining work after Phase 9
-- Phase 10: CLI/lifecycle/monitoring/deployment (`main.py`, service + udev assets)
+- Phase 11: commissioning and replay tools (`gpio_selftest.py`, `scope_bench.py`,
+  `calibrate_camera.py`, `simulate.py`, `replay_waveform.py`)
+
+## Implemented in Phase 10
+- CLI/lifecycle entry point in [main.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/main.py)
+  with `start`, `resume`, `status`, and guarded `simulate` commands
+- Config schema extended in [config.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/config.py)
+  and [config.yaml](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/config.yaml)
+  to include `modes.gpio_mode`
+- Resume override support added to [recorder.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/recorder.py)
+  via unchecked runstate read for explicit config-hash override paths
+- Deployment assets:
+  - systemd unit [ccid-automation.service](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/deploy/ccid-automation.service)
+  - udev rule [99-keysight-usbtmc.rules](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/deploy/99-keysight-usbtmc.rules)
+  - operator instructions [DEPLOYMENT.txt](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/DEPLOYMENT.txt)
+- CLI/lifecycle tests in [test_main.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_main.py)
+
+## Phase 10 behaviors covered
+- CLI supports:
+  - starting a new run
+  - resuming a named or latest run
+  - explicit config-hash override on resume
+  - safe status reporting without energizing hardware
+  - guarded simulation/fault-injection entry path separate from production defaults
+- HAL selection now includes GPIO/contactor mode alongside scope and camera mode
+- SIGINT/SIGTERM handlers request a safe stop instead of abruptly abandoning the run
+- SafeOff is invoked on all lifecycle exits in the CLI path
+- systemd notify integration:
+  - `READY=1` and `STOPPING=1`
+  - watchdog pings independent of external heartbeat reachability
+  - watchdog-aware sleep splits long waits into pingable chunks
+- Outbound monitoring/notification behavior:
+  - healthchecks heartbeat sent only through recorder commit hook after durable cycle commit
+  - heartbeat fail endpoint used on terminal halt
+  - ntfy + heartbeat failures are logged and never halt the campaign
+- Deployment assets document venv setup, udev permissions, environment-secret injection, and service usage
+
+## Remaining work after Phase 10
 - Phase 11: commissioning and replay tools (`gpio_selftest.py`, `scope_bench.py`,
   `calibrate_camera.py`, `simulate.py`, `replay_waveform.py`)

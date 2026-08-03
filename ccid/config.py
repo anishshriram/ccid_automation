@@ -48,7 +48,8 @@ _TIMING_KEYS = frozenset(
         "mains_stagger_ms",
     }
 )
-_MODES_KEYS = frozenset({"scope_mode", "camera_mode"})
+_MODES_KEYS = frozenset({"gpio_mode", "scope_mode", "camera_mode"})
+_SUPPORTED_GPIO_MODES = frozenset({"real", "sim"})
 _PATHS_KEYS = frozenset({"run_root", "output_root"})
 _MONITORING_KEYS = frozenset({"heartbeat_url_env"})
 _ANALYSIS_KEYS = frozenset(
@@ -97,6 +98,7 @@ class TimingConfig:
 
 @dataclass(frozen=True)
 class ModesConfig:
+    gpio_mode: str
     scope_mode: str
     camera_mode: str
 
@@ -202,12 +204,19 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
         raise ConfigValidationError(
             f"Unsupported scope mode '{scope_mode}'; supported: {sorted(_SUPPORTED_SCOPE_MODES)}"
         )
+    gpio_mode = modes_map.get("gpio_mode", "sim")
+    if not isinstance(gpio_mode, str):
+        raise ConfigValidationError("gpio_mode must be a string")
+    if gpio_mode not in _SUPPORTED_GPIO_MODES:
+        raise ConfigValidationError(
+            f"Unsupported gpio mode '{gpio_mode}'; supported: {sorted(_SUPPORTED_GPIO_MODES)}"
+        )
     camera_mode = _require_str(modes_map, "camera_mode")
     if camera_mode not in _SUPPORTED_CAMERA_MODES:
         raise ConfigValidationError(
             f"Unsupported camera mode '{camera_mode}'; supported: {sorted(_SUPPORTED_CAMERA_MODES)}"
         )
-    modes = ModesConfig(scope_mode=scope_mode, camera_mode=camera_mode)
+    modes = ModesConfig(gpio_mode=gpio_mode, scope_mode=scope_mode, camera_mode=camera_mode)
 
     run_root = _require_non_empty_path(paths_map, "run_root")
     output_root = _require_non_empty_path(paths_map, "output_root")
@@ -371,4 +380,3 @@ def _require_non_empty_path(raw: dict[str, Any], key: str) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ConfigValidationError(f"'{key}' must be a non-empty path string")
     return Path(value).expanduser()
-

@@ -18,6 +18,7 @@ timing:
   mains_stagger_ms: 0
 
 modes:
+  gpio_mode: sim
   scope_mode: sim
   camera_mode: sim
 
@@ -58,4 +59,3 @@ analysis:
   residual_floor_noise_multiple: 5.0
   noise_collapse_multiple: 6.0
   endpoint_uncertainty_s: 0.0005
-

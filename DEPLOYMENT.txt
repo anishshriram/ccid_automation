@@ -1,0 +1,55 @@
+CCID deployment notes
+=====================
+
+1. Create target layout
+   - Copy this repository to /opt/ccid
+   - Create a dedicated service account, for example:
+       sudo useradd --system --create-home --home-dir /opt/ccid --shell /usr/sbin/nologin ccid
+   - Ensure /opt/ccid and its runs directory are writable by that account
+
+2. Python environment
+   - Create a virtual environment:
+       python3 -m venv /opt/ccid/venv
+   - Install pinned dependencies:
+       /opt/ccid/venv/bin/pip install -r /opt/ccid/requirements.txt
+
+3. GPIO and scope access
+   - Install the udev rule from deploy/99-keysight-usbtmc.rules into /etc/udev/rules.d/
+   - Reload udev rules:
+       sudo udevadm control --reload-rules
+       sudo udevadm trigger
+   - Add the service user to plugdev:
+       sudo usermod -a -G plugdev ccid
+   - On Raspberry Pi, ensure gpiozero uses lgpio on target
+
+4. systemd watchdog
+   - In /etc/systemd/system.conf set:
+       RuntimeWatchdogSec=10
+       RebootWatchdogSec=60
+   - Install deploy/ccid-automation.service into /etc/systemd/system/
+   - Reload and enable:
+       sudo systemctl daemon-reload
+       sudo systemctl enable ccid-automation.service
+
+5. Secrets and environment injection
+   - Create /etc/default/ccid-automation with the environment variables below.
+   - Do not commit this file.
+   - Minimum variables:
+       CCID_SCOPE_RESOURCE=USB0::0x0957::0x1798::MY58100795::INSTR
+       CCID_HEALTHCHECKS_URL=https://hc-ping.com/your-uuid
+   - Optional ntfy notification topic:
+       CCID_NTFY_TOPIC_URL=https://ntfy.sh/your-topic
+
+6. Service operation
+   - Start a brand new run manually:
+       /opt/ccid/venv/bin/python -m ccid.main --config /opt/ccid/config.yaml start
+   - Resume the latest run manually:
+       /opt/ccid/venv/bin/python -m ccid.main --config /opt/ccid/config.yaml resume --latest
+   - Query safe status:
+       /opt/ccid/venv/bin/python -m ccid.main --config /opt/ccid/config.yaml status --latest
+
+7. Safety and commissioning reminders
+   - Safe software behavior is not a substitute for ground bonding, flyback diodes,
+     gate pulldowns, correct wiring, restricted access, and staged commissioning.
+   - Real hardware paths in software are implemented, but hardware validation remains
+     NOT RUN - HARDWARE REQUIRED until commissioning stages are completed on target.
