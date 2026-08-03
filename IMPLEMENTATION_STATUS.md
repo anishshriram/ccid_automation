@@ -1,14 +1,15 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 5: Recorder and resume semantics (implemented).
+- Phase 6: Vision classification (implemented).
 
-## Phase 1-5 Implementation Summary
+## Phase 1-6 Implementation Summary
 - Phase 1: Domain model, errors, clock, config with locked defaults
 - Phase 2: HAL base contracts and protocol tests
 - Phase 3: GPIO simulator, SafeOff aggregation, safety layer tests
 - Phase 4: Deterministic scope and camera simulators with fault branches
 - Phase 5: Recorder/resume with crash-safe commit order and orphan cleanup
+- Phase 6: HSV LED classification, temporal window, and charging-gate polling
 
 ## Locked values set
 - `gpio_k1=17`, `gpio_k2=27`, `gpio_k3=22`
@@ -33,7 +34,8 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (38 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (83 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_classify.py'` (45 tests)
 - Failing: none in any phase
 
 ## Hardware-dependent items not executed
@@ -103,9 +105,43 @@
 - Heartbeat sent only after durable state achieved
 - CSV schema: cycle_index, run_id, utc_timestamp, monotonic_start, trip_time_s, verdict, analysis_version, led_state_at_gate, degraded_flags, notes
 - Deterministic crash injection points (before CSV flush, after CSV, before runstate)
-- All 38 unit tests passing
+- All 38 unit tests passing at end of Phase 5
 
-## Remaining work after Phase 5
-- Phase 6: Vision classification (classify.py) - HSV-based LED state detection, await_charging_gate() polling
-- Phase 7: Analysis boundary (analysis.py) - Versioned analysis interface, sanity checks, burst envelope extraction
-- Phase 8+: Sequencer state machine, real HALs, deployment
+## Implemented in Phase 6
+- HSV LED classifier, temporal window, and charging gate in [classify.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/classify.py)
+- Vision exception taxonomy in [errors.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/errors.py) (`VisionError`, `VisionFrameError`)
+- Vision tests in [test_classify.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_classify.py) (45 tests)
+- `numpy>=1.26` added to `requirements.txt` (no OpenCV dependency in the domain module)
+
+## Phase 6 vision behaviors covered
+- HSV (not RGB) classification over a single fixed ROI, with a centred-fallback ROI
+- Per-frame classification to `off / blue / green / red / booting / unknown` with confidence
+- Domain mapping: blue -> READY, green -> CHARGING, red -> FAULTED, multiple hues -> BOOTING,
+  no reliable LED -> OFF_OR_UNKNOWN, no frame source -> CAMERA_UNAVAILABLE
+- ~3 s temporal window at ~15 fps (45-frame ring buffer) classified by hue presence,
+  deliberately independent of blink rate
+- N=5 consecutive agreeing full-window classifications required before a state change is declared
+- Partial windows never declare a state; a spurious single-frame hue cannot flip the window
+- Confidence scoring from hue dominance, saturation, and value (dim/desaturated scores lower)
+- Dropped frames are tolerated without resetting agreement; 15 consecutive drops mean camera failure
+- Exposure variation (darkening to off, brightening) and sensor noise fixtures
+- Deterministic seeded fixtures: solid, blinking, booting, exposure ramp, dropped-frame sequences
+- `await_charging_gate()` returns `(success, led_state_at_timeout, degraded)` with injected clock/sleep
+- Vision-gate timeout branches via `gate_timeout_action()`:
+  faulted (blinking red) -> retry once with 60 s extended cooldown (`latch_slow_clear`);
+  ready (blue) -> HALT, no retry; off/unknown -> HALT, no retry; stuck booting -> HALT;
+  camera unavailable -> degraded fixed 60 s wait
+- Vision never kills the run: camera exceptions and FAILED health are caught, logged, and
+  degraded to the fixed 60 s wait with a `vision_camera_unavailable_fixed_wait` degraded flag
+- All optical/temporal thresholds live in `LedOpticalConfig`; no scattered constants
+- Classification never computes trip time
+
+## Phase 6 deviation notes
+- Camera-unavailable degradation returns `LedState.CAMERA_UNAVAILABLE` rather than a generic
+  "unknown", so the sequencer cannot confuse it with the off/no-LED halt branch.
+
+## Remaining work after Phase 6
+- Phase 7: Analysis boundary (analysis.py) - versioned analysis interface, sanity checks,
+  burst envelope extraction, boundary tests at 24.97 ms and 100 ms
+- Phase 8+: Sequencer state machine (including the three-way vision-timeout branch and the
+  extended-cooldown retry path), real HALs, deployment

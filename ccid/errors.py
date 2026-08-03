@@ -36,3 +36,11 @@ class ResumeBlockedError(CcidError):
 
 class ConfigHashMismatchError(CcidError):
     """Resume config hash mismatch; explicit override required."""
+
+
+class VisionError(CcidError):
+    """Vision/classification subsystem error. Never allowed to halt the run."""
+
+
+class VisionFrameError(VisionError):
+    """Camera frame is missing, malformed, or incompatible with the configured ROI."""
