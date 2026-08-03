@@ -7,6 +7,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+from ccid.analysis import (
+    DEFAULT_ENDPOINT_DEFINITION,
+    AnalysisConfig,
+    AnalysisVersion,
+)
 from ccid.errors import ConfigFileError, ConfigValidationError
 
 try:
@@ -25,6 +30,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "modes",
         "paths",
         "monitoring",
+        "analysis",
     }
 )
 _GPIO_KEYS = frozenset({"k1", "k2", "k3"})
@@ -45,6 +51,25 @@ _TIMING_KEYS = frozenset(
 _MODES_KEYS = frozenset({"scope_mode", "camera_mode"})
 _PATHS_KEYS = frozenset({"run_root", "output_root"})
 _MONITORING_KEYS = frozenset({"heartbeat_url_env"})
+_ANALYSIS_KEYS = frozenset(
+    {
+        "algorithm_version",
+        "endpoint_definition",
+        "line_frequency_hz",
+        "envelope_window_cycles",
+        "envelope_on_fraction",
+        "envelope_off_fraction",
+        "noise_floor_v",
+        "collapse_persistence_cycles",
+        "signal_present_rms_v",
+        "pretrigger_leakage_rms_v",
+        "burst_start_tolerance_s",
+        "pretrigger_leakage_guard_cycles",
+        "residual_floor_noise_multiple",
+        "noise_collapse_multiple",
+        "endpoint_uncertainty_s",
+    }
+)
 _SUPPORTED_SCOPE_MODES = frozenset({"real", "sim"})
 _SUPPORTED_CAMERA_MODES = frozenset({"real", "sim"})
 
@@ -95,6 +120,7 @@ class AppConfig:
     modes: ModesConfig
     paths: PathsConfig
     monitoring: MonitoringConfig
+    analysis: AnalysisConfig
 
     def canonical_hash(self) -> str:
         canonical_payload = _canonical_for_hash(self)
@@ -193,6 +219,12 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
             raise ConfigValidationError("heartbeat_url_env must be a non-empty string when set")
     monitoring = MonitoringConfig(heartbeat_url_env=heartbeat_url_env)
 
+    analysis = _build_analysis(
+        raw.get("analysis"),
+        pass_limit_s=timing.pass_limit_s,
+        no_trip_limit_s=timing.no_trip_limit_s,
+    )
+
     return AppConfig(
         schema_version=schema_version,
         gpio=gpio,
@@ -200,16 +232,91 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
         modes=modes,
         paths=paths,
         monitoring=monitoring,
+        analysis=analysis,
     )
+
+
+def _build_analysis(
+    raw_analysis: Any,
+    *,
+    pass_limit_s: float,
+    no_trip_limit_s: float,
+) -> AnalysisConfig:
+    """Build the analysis configuration; the whole section is optional.
+
+    The endpoint definition lives here on purpose (handoff section 4): if
+    UL 2231-2 does not define the measurement endpoints, the chosen definition
+    must be written into `config.yaml` before the run and frozen by the config
+    hash.
+    """
+
+    if raw_analysis is None:
+        raw_analysis = {}
+    if not isinstance(raw_analysis, dict):
+        raise ConfigValidationError("'analysis' must be a mapping")
+    _reject_unknown_keys("analysis", raw_analysis, _ANALYSIS_KEYS)
+
+    version_text = raw_analysis.get("algorithm_version")
+    if version_text is None:
+        algorithm_version = AnalysisConfig.algorithm_version
+    else:
+        if not isinstance(version_text, str):
+            raise ConfigValidationError("'algorithm_version' must be a string")
+        try:
+            algorithm_version = AnalysisVersion(version_text)
+        except ValueError as exc:
+            supported = sorted(member.value for member in AnalysisVersion)
+            raise ConfigValidationError(
+                f"Unsupported analysis algorithm_version '{version_text}'; supported: {supported}"
+            ) from exc
+
+    endpoint_definition = raw_analysis.get("endpoint_definition", DEFAULT_ENDPOINT_DEFINITION)
+    if not isinstance(endpoint_definition, str) or not endpoint_definition.strip():
+        raise ConfigValidationError("'endpoint_definition' must be a non-empty string")
+
+    numeric_keys = (
+        "line_frequency_hz",
+        "envelope_window_cycles",
+        "envelope_on_fraction",
+        "envelope_off_fraction",
+        "noise_floor_v",
+        "collapse_persistence_cycles",
+        "signal_present_rms_v",
+        "pretrigger_leakage_rms_v",
+        "burst_start_tolerance_s",
+        "pretrigger_leakage_guard_cycles",
+        "residual_floor_noise_multiple",
+        "noise_collapse_multiple",
+        "endpoint_uncertainty_s",
+    )
+    numeric: dict[str, float] = {}
+    for key in numeric_keys:
+        if key in raw_analysis:
+            numeric[key] = _require_float(raw_analysis, key)
+
+    try:
+        return AnalysisConfig(
+            pass_limit_s=pass_limit_s,
+            no_trip_limit_s=no_trip_limit_s,
+            algorithm_version=algorithm_version,
+            endpoint_definition=endpoint_definition,
+            **numeric,
+        )
+    except ValueError as exc:
+        raise ConfigValidationError(f"Invalid analysis configuration: {exc}") from exc
 
 
 def _canonical_for_hash(config: AppConfig) -> dict[str, Any]:
     raw = asdict(config)
+    analysis = dict(raw["analysis"])
+    analysis["algorithm_version"] = config.analysis.algorithm_version.value
     return {
         "schema_version": raw["schema_version"],
         "gpio": raw["gpio"],
         "timing": raw["timing"],
         "modes": raw["modes"],
+        # The endpoint definition is part of the frozen campaign contract.
+        "analysis": analysis,
         "paths": {
             "run_root": str(config.paths.run_root),
             "output_root": str(config.paths.output_root),

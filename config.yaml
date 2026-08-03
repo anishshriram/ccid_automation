@@ -28,3 +28,34 @@ paths:
 monitoring:
   heartbeat_url_env: CCID_HEALTHCHECKS_URL
 
+# Trip-time analysis. The algorithm is deferred (handoff section 4), but the
+# measurement endpoints are not: UL 2231-2 section 23.3.1 is the authority, and
+# until its endpoint definition is confirmed on paper the definition below is
+# the one this campaign uses. Frozen by the config hash; change it only by
+# introducing a new analysis algorithm_version.
+analysis:
+  algorithm_version: v1
+  endpoint_definition: >-
+    v1 endpoints: t0 is the K3 close (leakage injection) instant expressed in the
+    scope time base, taken from the per-cycle sidecar when available and otherwise
+    from the trigger instant (x_origin reference, t=0). The burst end is confirmed
+    when the envelope (leading half-mains-cycle sliding maximum of |v|) stays below
+    the collapse threshold for at least one full mains cycle; t_end is then the last
+    sample above the residual floor at or after the final collapse-threshold
+    crossing, searched no further than a quarter mains cycle.
+    trip_time_s = t_end - t0. Supersede only by re-versioning AnalysisVersion;
+    never by editing in place.
+  line_frequency_hz: 60.0
+  envelope_window_cycles: 0.5
+  envelope_on_fraction: 0.25
+  envelope_off_fraction: 0.10
+  noise_floor_v: 0.5
+  collapse_persistence_cycles: 1.0
+  signal_present_rms_v: 1.0
+  pretrigger_leakage_rms_v: 1.0
+  burst_start_tolerance_s: 0.020
+  pretrigger_leakage_guard_cycles: 1.0
+  residual_floor_noise_multiple: 5.0
+  noise_collapse_multiple: 6.0
+  endpoint_uncertainty_s: 0.0005
+

@@ -38,6 +38,18 @@ class ConfigHashMismatchError(CcidError):
     """Resume config hash mismatch; explicit override required."""
 
 
+class AnalysisError(CcidError):
+    """Waveform analysis subsystem error."""
+
+
+class WaveformAnalysisError(AnalysisError):
+    """A waveform could not be analysed."""
+
+
+class WaveformFormatError(WaveformAnalysisError):
+    """Stored waveform container or preamble is missing, malformed, or unusable."""
+
+
 class VisionError(CcidError):
     """Vision/classification subsystem error. Never allowed to halt the run."""
 

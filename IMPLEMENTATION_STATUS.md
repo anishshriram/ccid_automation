@@ -1,15 +1,16 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 6: Vision classification (implemented).
+- Phase 7: Analysis boundary (implemented).
 
-## Phase 1-6 Implementation Summary
+## Phase 1-7 Implementation Summary
 - Phase 1: Domain model, errors, clock, config with locked defaults
 - Phase 2: HAL base contracts and protocol tests
 - Phase 3: GPIO simulator, SafeOff aggregation, safety layer tests
 - Phase 4: Deterministic scope and camera simulators with fault branches
 - Phase 5: Recorder/resume with crash-safe commit order and orphan cleanup
 - Phase 6: HSV LED classification, temporal window, and charging-gate polling
+- Phase 7: Versioned analysis boundary, burst-envelope trip time, sanity checks
 
 ## Locked values set
 - `gpio_k1=17`, `gpio_k2=27`, `gpio_k3=22`
@@ -34,7 +35,8 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (83 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (150 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_analysis.py'` (67 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_classify.py'` (45 tests)
 - Failing: none in any phase
 
@@ -143,5 +145,56 @@
 ## Remaining work after Phase 6
 - Phase 7: Analysis boundary (analysis.py) - versioned analysis interface, sanity checks,
   burst envelope extraction, boundary tests at 24.97 ms and 100 ms
+
+## Implemented in Phase 7
+- Versioned analysis boundary in [analysis.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/analysis.py)
+  (`AnalysisVersion`, `Verdict`, `AnalysisConfig`, `TripResult`, `Waveform`,
+  `analyze_waveform` / `analyze_waveform_file` / `analyze_samples`)
+- Analysis exception taxonomy in [errors.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/errors.py)
+  (`AnalysisError`, `WaveformAnalysisError`, `WaveformFormatError`)
+- Optional strict `analysis:` section in [config.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/ccid/config.py)
+  and [config.yaml](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/config.yaml),
+  included in the canonical config hash
+- Analysis tests in [test_analysis.py](C:/Users/shrirama/OneDrive - Legrand France/Desktop/EE_InternFiles/ccid_automation/tests/test_analysis.py) (67 tests)
+- Synthetic waveform fixtures (`synthesize_burst_samples`, `synthesize_waveform_npz`) exported for
+  tests and for future `tools/replay_waveform.py`
+
+## Phase 7 analysis behaviors covered
+- `AnalysisVersion` enum (v1) recorded on every `TripResult`; a future v2 algorithm can be added
+  without changing the .npz waveform format or the `cycles.csv` schema
+- `TripResult(trip_time_s, verdict, sanity_checks, notes, algorithm_version)` with `to_dict()` /
+  `from_dict()` so trip time and verdict are recorded separately and re-analysis stays possible
+- Burst envelope extraction via an O(n) sliding-max over a half-mains-cycle window, which bridges
+  AC zero crossings: the measurand is the whole burst, never a single 8.33 ms half cycle
+- Endpoint refinement plus a robust `reference_amplitude` (median of the largest magnitudes) and a
+  block-RMS noise estimate, so thresholds scale with the record instead of being hard-coded
+- t=0 precedence: explicit sidecar `injection_time_s` -> preamble `k3_close_time_s` -> detected
+  conduction onset -> trigger time; the source is written into `notes` as `t0_source=...`
+  (the scope trigger is never assumed to be t=0, since +20 V can fire up to a half cycle late)
+- Verdict table: `<= 24.97 ms` PASS, `24.97-100 ms` FAIL (alert, continue), `>= 100 ms` or no-trip
+  NO_TRIP (`Verdict.halts_run`)
+- Asymmetric `endpoint_uncertainty_s` applied only at the no-trip boundary; the pass limit stays
+  strict, so endpoint ambiguity can only push a verdict toward the cautious HALT
+- Six sanity checks always present in every result (`signal_present`, `no_pretrigger_leakage`,
+  `record_spans_no_trip_limit`, `burst_starts_near_t0`, `collapse_is_clean`, `no_trip_persistent`);
+  failures are logged and appended to notes but never veto the verdict
+- Pre-trigger leakage (K3 stuck closed) detected both by pre-t0 RMS and by conduction already
+  present in the first envelope sample of a record with real pre-trigger depth
+- Both waveform containers loaded: numpy `.npz` (`samples` + JSON `preamble`) and the recorder's
+  zip bundle (`samples.bin` BYTE codes + `preamble.json`), with integer-to-volts scaling
+- Endpoint definition text is frozen in `config.yaml`, matched against `DEFAULT_ENDPOINT_DEFINITION`
+  by test, and covered by the config hash, so it cannot drift mid-campaign
+- Analysis is offline-only: nothing here re-analyzes at runtime
+
+## Phase 7 deviation notes
+- The trip-time algorithm remains deliberately deferred; v1 is a documented threshold/envelope stub
+  measured at ~8 us of truth on clean synthetic data and biased slightly early under heavy noise.
+- The endpoint definition should ultimately be taken from UL 2231-2; until that is confirmed on
+  paper, `config.yaml` `analysis.endpoint_definition` is the authoritative, hash-frozen definition.
+- Adding the `analysis:` section to the canonical hash changes config hashes computed before
+  Phase 7; no committed hash constants existed, so no stored run is invalidated.
+
+## Remaining work after Phase 7
 - Phase 8+: Sequencer state machine (including the three-way vision-timeout branch and the
-  extended-cooldown retry path), real HALs, deployment
+  extended-cooldown retry path), `tools/replay_waveform.py` offline re-analysis CLI,
+  real HALs, deployment
