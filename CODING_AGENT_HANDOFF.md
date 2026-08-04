@@ -11,9 +11,8 @@ This file is for a fresh coding agent resuming implementation work in this repos
 ## Current repository state
 
 - Branch: `development`
-- Latest commit: `9646e6a` - `add CLI lifecycle deployment assets and monitoring hooks`
-- Working tree status at handoff creation: clean
-- Tests passing: `python -m unittest discover -s tests -p 'test_*.py'` -> **175 passed**
+- All 11 phases are implemented, including Phase 11 commissioning/replay tools.
+- Tests passing: `python -m unittest discover -s tests -p 'test_*.py'` -> **229 passed**
 
 ## What is complete
 
@@ -56,6 +55,14 @@ This file is for a fresh coding agent resuming implementation work in this repos
   - [deploy/ccid-automation.service](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/deploy/ccid-automation.service)
   - [deploy/99-keysight-usbtmc.rules](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/deploy/99-keysight-usbtmc.rules)
   - [DEPLOYMENT.txt](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/DEPLOYMENT.txt)
+
+### Phase 11
+- Commissioning and offline-replay tools, all defaulting to simulated/de-energized hardware:
+  - [tools/simulate.py](tools/simulate.py) - accelerated simulated campaigns, fault injection, crash-injection/resume verification, sticky-halt verification
+  - [tools/replay_waveform.py](tools/replay_waveform.py) - offline re-analysis of committed waveforms, read-only against original data, auditable change report
+  - [tools/gpio_selftest.py](tools/gpio_selftest.py) - guarded single-contactor exercise + mains-mismatch-detector test
+  - [tools/scope_bench.py](tools/scope_bench.py) - scope IDN/config/readback/arm-polling/memory-depth/capture-timing bench
+  - [tools/calibrate_camera.py](tools/calibrate_camera.py) - ROI + HSV hue-range proposal, temporal classification verification, CameraSim replay-footage generation
 
 ## Important locked behavior already encoded
 
@@ -121,24 +128,24 @@ This file is for a fresh coding agent resuming implementation work in this repos
 - [tests/test_scope_sim.py](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/tests/test_scope_sim.py)
 - [tests/test_sequencer.py](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/tests/test_sequencer.py)
 - [tests/test_states.py](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/tests/test_states.py)
+- [tests/test_tools_simulate.py](tests/test_tools_simulate.py)
+- [tests/test_tools_replay_waveform.py](tests/test_tools_replay_waveform.py)
+- [tests/test_tools_gpio_selftest.py](tests/test_tools_gpio_selftest.py)
+- [tests/test_tools_scope_bench.py](tests/test_tools_scope_bench.py)
+- [tests/test_tools_calibrate_camera.py](tests/test_tools_calibrate_camera.py)
 
 ## What remains
 
-Only **Phase 11** remains.
+The software implementation is complete: all 11 phases from `coding_instructions.txt`
+are implemented and unit-tested off target (229 tests passing).
 
-Phase 11 tools to implement:
-- [tools/gpio_selftest.py](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/tools)
-- [tools/scope_bench.py](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/tools)
-- [tools/calibrate_camera.py](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/tools)
-- [tools/simulate.py](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/tools)
-- [tools/replay_waveform.py](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/tools)
-
-Recommended order if budget is tight:
-1. `simulate.py`
-2. `replay_waveform.py`
-3. `gpio_selftest.py`
-4. `scope_bench.py`
-5. `calibrate_camera.py`
+What genuinely remains is hardware commissioning, which no coding agent can complete
+from software alone:
+- Electrical commissioning stages 1-6 (`coding_instructions.txt` section 13)
+- The full simulated-then-real 6,000-cycle campaign on target hardware
+- Resolving open hardware item 16 (K1/K2 physical-state readback) before Stage 6
+- Confirming the UL 2231-2 endpoint definition against `config.yaml`'s
+  `analysis.endpoint_definition` before it is treated as final
 
 ## User preferences and workflow constraints
 
@@ -152,7 +159,6 @@ Recommended order if budget is tight:
 
 ## Useful recent commits
 
-- `9646e6a` - add CLI lifecycle deployment assets and monitoring hooks
 - `2e1126f` - add real hardware HAL implementations and guarded tests
 - `743f949` - add sequencer state machine and integration tests
 - `0f61207` - add phase 7 versioned waveform analysis boundary
@@ -161,9 +167,7 @@ Recommended order if budget is tight:
 
 ## Recommended next action
 
-Implement Phase 11 in bounded pieces, starting with:
-
-1. `tools/simulate.py`
-2. `tools/replay_waveform.py`
-
-These give the highest value for remaining software validation while avoiding hardware coupling.
+There is no further software phase to implement. The next action is hardware
+commissioning (Stages 1-6) with the tools now in `tools/`, starting with
+`gpio_selftest.py show-pins` / `exercise` and `scope_bench.py identify` on
+target hardware once it is available.

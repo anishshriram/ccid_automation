@@ -1,7 +1,7 @@
 # IMPLEMENTATION STATUS
 
 ## Current phase
-- Phase 10: CLI, lifecycle, monitoring, and deployment (implemented).
+- Phase 11: commissioning and replay tools (implemented). All 11 phases are now complete.
 
 ## Phase 1-10 Implementation Summary
 - Phase 1: Domain model, errors, clock, config with locked defaults
@@ -14,6 +14,11 @@
 - Phase 8: Explicit sequencer state machine with retry/degrade/halt orchestration
 - Phase 9: Real GPIO/scope/camera HAL modules with hardware-guarded tests
 - Phase 10: CLI entry point, signal-safe lifecycle, status commands, watchdog/notification wiring, and deployment assets
+
+## Phase 1-11 Implementation Summary (addendum)
+- Phase 11: `tools/simulate.py`, `tools/replay_waveform.py`, `tools/gpio_selftest.py`,
+  `tools/scope_bench.py`, `tools/calibrate_camera.py` — guarded commissioning and
+  offline-replay utilities, all defaulting to simulated/de-energized hardware
 
 ## Locked values set
 - `gpio_k1=17`, `gpio_k2=27`, `gpio_k3=22`
@@ -38,7 +43,7 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (175 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (229 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_analysis.py'` (67 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_classify.py'` (45 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_sequencer.py'` (10 tests)
@@ -46,6 +51,11 @@
 - Passing: `python -m unittest discover -s tests -p 'test_scope_real.py'` (2 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_camera_real.py'` (2 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_main.py'` (7 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_tools_simulate.py'` (9 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_tools_replay_waveform.py'` (9 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_tools_gpio_selftest.py'` (12 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_tools_scope_bench.py'` (12 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_tools_calibrate_camera.py'` (12 tests)
 - Failing: none in any phase
 
 ## Hardware-dependent items not executed
@@ -307,3 +317,82 @@
 ## Remaining work after Phase 10
 - Phase 11: commissioning and replay tools (`gpio_selftest.py`, `scope_bench.py`,
   `calibrate_camera.py`, `simulate.py`, `replay_waveform.py`)
+
+## Implemented in Phase 11
+- Accelerated simulated-campaign runner in [simulate.py](tools/simulate.py):
+  always uses simulated GPIO/scope/camera HALs; `campaign` runs an accelerated
+  multi-cycle simulated run with per-run scope/camera/gpio fault injection;
+  `crash-resume` injects a one-shot software crash at a named `RunRecorder`
+  commit checkpoint and then resumes from the same run directory to verify no
+  skipped/duplicated cycle and safe K3->K2->K1 opening order; `sticky-halt-check`
+  forces a rig-fault halt and confirms resume is refused without an explicit
+  override
+- Offline waveform re-analysis tool in [replay_waveform.py](tools/replay_waveform.py):
+  replays one `.npz` waveform, a cycle range, or a whole run against a
+  (possibly different) `AnalysisVersion`; every original artifact
+  (`waveforms/`, `cycles/`, `cycles.csv`, `runstate.json`) is opened read-only,
+  and every output is written under a fresh `reanalysis/<replay_id>/`
+  directory with a `manifest.json` and a `change_report.csv` diffing
+  replayed vs original trip time/verdict per cycle; replayed results are
+  tagged `"source": "replay"` so they can never be confused with the
+  original inline analysis
+- Guarded single-contactor exercise tool in [gpio_selftest.py](tools/gpio_selftest.py):
+  defaults to the simulated contactor controller; `--real` requires an
+  explicit `--i-understand-this-energizes-hardware` acknowledgement; `show-pins`
+  prints the BCM GPIO and standard 40-pin-header physical pin for K1/K2/K3;
+  `exercise` closes/opens one contactor a bounded number of times, always
+  starting and ending de-energized, and drives K3 only through its normal
+  interlocked path (K1/K2 closed first, fresh charging-gate token per pulse);
+  `mismatch-test` closes K1 only and confirms `detect_mains_command_mismatch`
+  honors the configured `mains_stagger_ms` window in both directions
+- Oscilloscope commissioning/bench tool in [scope_bench.py](tools/scope_bench.py):
+  defaults to the deterministic scope simulator; `--real` requires a VISA
+  resource (`--resource` or `CCID_SCOPE_RESOURCE`); `identify` runs `*IDN?`;
+  `configure` applies and reads back the full per-cycle scope configuration;
+  `arm-check` issues `:SINGle` and verifies armed-state polling; `memory-depth`
+  reports the configured/reported waveform points settings via the existing
+  readback contract; `capture-bench` arms, waits for acquisition, times the
+  bundled BYTE+PNG `capture_after_acquire()` transfer, and saves+validates a
+  bench capture (round-tripped through `ccid.analysis.load_waveform`)
+- LED-status-camera calibration tool in [calibrate_camera.py](tools/calibrate_camera.py):
+  computes/saves a fixed ROI from captured frames; proposes per-colour HSV hue
+  ranges from captured red/green/blue footage using a circular-mean-rotated
+  percentile band (avoids a spurious split at the red 0/360 wrap point);
+  verifies temporal classification of captured footage through the real
+  `ccid.classify.LedClassifier` (the same code path `await_charging_gate`
+  uses); packages captured frames into `CameraSim` replay footage
+  (`CameraSimFrameFixture`/base64 JSON, validated by round-tripping through a
+  real `CameraSim(replay_file=...)` load in tests)
+- Tool tests: [test_tools_simulate.py](tests/test_tools_simulate.py) (9),
+  [test_tools_replay_waveform.py](tests/test_tools_replay_waveform.py) (9),
+  [test_tools_gpio_selftest.py](tests/test_tools_gpio_selftest.py) (12),
+  [test_tools_scope_bench.py](tests/test_tools_scope_bench.py) (12),
+  [test_tools_calibrate_camera.py](tests/test_tools_calibrate_camera.py) (12)
+
+## Phase 11 deviation notes
+- `simulate.py`'s `crash-resume` models a software crash mid-persistence (an
+  unhandled Python exception raised inside a `RunRecorder` commit checkpoint),
+  the same property `tests/test_resume.py` already covers at the recorder
+  level. It is not a substitute for testing real power loss or `kill -9`
+  against the deployed process, which `coding_instructions.txt` explicitly
+  calls out as deployment-validation, not something a unit test can prove.
+- `scope_bench.py`'s `capture-bench` times the bundled BYTE+PNG transfer as a
+  single duration because `ScopeInterface.capture_after_acquire()` bundles
+  both by contract; splitting the two would require extending the interface,
+  which this tool does not do. Both artifact sizes are still reported.
+- `calibrate_camera.py`'s proposed HSV ranges and the `verify` "matched" flag
+  are calibration aids for the operator to review; nothing in this tool edits
+  `config.yaml` or `LedOpticalConfig` defaults automatically.
+- All five Phase 11 tools default to simulated/de-energized hardware; real
+  hardware paths (`--real` on `gpio_selftest.py`/`scope_bench.py`, image
+  loading via OpenCV in `calibrate_camera.py`) are implemented but **NOT RUN -
+  HARDWARE REQUIRED**, consistent with every other real-HAL path in this repo.
+
+## Definition-of-done status
+All required modules, HAL contracts, safety invariants, fault-matrix tests,
+persistence/resume guarantees, and Phase 1-11 deliverables listed in
+`coding_instructions.txt` section 13 are implemented and unit-tested off
+target. Electrical commissioning (Stages 1-6), the full simulated 6,000-cycle
+campaign, and every hardware-dependent check remain **NOT RUN - HARDWARE
+REQUIRED**; this repository is a complete software implementation, not a
+substitute for physical commissioning.
