@@ -75,6 +75,7 @@ class ScopeReal(ScopeInterface):
         self._require_connected()
         self._settings = settings
         commands = [
+            ":STOP",
             f":TIMebase:SCALe {settings.timebase_scale_s_per_div}",
             f":TIMebase:REFerence {settings.timebase_reference}",
             f":CHANnel1:SCALe {settings.channel1_scale_v_per_div}",
@@ -88,8 +89,8 @@ class ScopeReal(ScopeInterface):
             f":ACQuire:TYPE {settings.acquire_type}",
             f":WAVeform:SOURce {settings.waveform_source}",
             f":WAVeform:FORMat {settings.waveform_format}",
-            f":WAVeform:POINts:MODE {settings.waveform_points_mode}",
             f":WAVeform:POINts {settings.waveform_points}",
+            f":WAVeform:POINts:MODE {settings.waveform_points_mode}",
         ]
         for cmd in commands:
             self._write(cmd)
