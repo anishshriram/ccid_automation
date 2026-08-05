@@ -1,0 +1,9 @@
+{
+  "red": {
+    "expected": "red",
+    "final_window_confidence": 0.4437375811385912,
+    "frames_observed": 71,
+    "matched": true,
+    "stable_color": "red"
+  }
+}
