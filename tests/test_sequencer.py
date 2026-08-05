@@ -90,6 +90,18 @@ class _ScriptedCamera:
             metadata={"source": "test"},
         )
 
+class _BlockingNeverTriggeredScope(ScopeSim):
+    def __init__(self, *, clock: _ManualClock, scenario: ScopeSimScenario) -> None:
+        super().__init__(scenario=scenario, monotonic_now=clock.now)
+        self._clock = clock
+
+    def wait_until_acquisition_complete(
+        self,
+        timeout_s: float,
+        now_monotonic_s: float,
+    ) -> bool:
+        self._clock.sleep(timeout_s)
+        return False
 
 class _AlwaysMismatchContactors(GpioSimContactorController):
     def detect_mains_command_mismatch(self, allowed_stagger_ms: int, now_monotonic_s: float) -> bool:
@@ -150,10 +162,12 @@ class SequencerTests(unittest.TestCase):
         camera,
         scope_scenario: ScopeSimScenario,
         contactors=None,
+        scope=None,
     ) -> Sequencer:
         if contactors is None:
             contactors = GpioSimContactorController(monotonic_now=self.clock.now)
-        scope = ScopeSim(scenario=scope_scenario, monotonic_now=self.clock.now)
+        if scope is None:
+            scope = ScopeSim(scenario=scope_scenario, monotonic_now=self.clock.now)
         return Sequencer(
             config=self.base_config,
             contactors=contactors,
@@ -260,6 +274,33 @@ class SequencerTests(unittest.TestCase):
         result = sequencer.run(run_dir=run_dir, state=state)
         self.assertEqual(result.terminal, Terminal.RIG_FAULT)
         self.assertEqual(result.fault_category, FaultCategory.RIG)
+
+    def test_k3_backstop_opens_before_blocking_acquisition_timeout(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(never_triggered=True)
+        scope = _BlockingNeverTriggeredScope(clock=self.clock, scenario=scenario)
+
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        events = contactors.events()
+        close_k3 = next(event for event in events if event.operation == "close_k3")
+        open_k3 = next(event for event in events if event.operation == "open_k3" and event.monotonic_s >= close_k3.monotonic_s)
+        k3_duration_s = open_k3.monotonic_s - close_k3.monotonic_s
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertLessEqual(
+            k3_duration_s,
+            self.base_config.timing.k3_backstop_s + 0.02,
+        )
 
     def test_pretrigger_leakage_halts_as_rig_fault(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)

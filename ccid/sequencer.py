@@ -416,7 +416,7 @@ class Sequencer:
                 self._contactors.open_k3()
                 opened = True
             if self._scope.wait_until_acquisition_complete(
-                timeout_s=acq_timeout_s,
+                timeout_s=min(0.01, acq_timeout_s - (now_s - start_s)),
                 now_monotonic_s=now_s,
             ):
                 if not opened:
