@@ -77,9 +77,10 @@ class AnalysisVersion(str, Enum):
     """
 
     V1 = "v1"
+    V2 = "v2"
 
 
-CURRENT_ANALYSIS_VERSION = AnalysisVersion.V1
+CURRENT_ANALYSIS_VERSION = AnalysisVersion.V2
 
 
 class Verdict(str, Enum):
@@ -96,7 +97,7 @@ class Verdict(str, Enum):
         return self is Verdict.NO_TRIP
 
 
-DEFAULT_ENDPOINT_DEFINITION = (
+V1_ENDPOINT_DEFINITION = (
     "v1 endpoints: t0 is the K3 close (leakage injection) instant expressed in the "
     "scope time base, taken from the per-cycle sidecar when available and otherwise "
     "from the trigger instant (x_origin reference, t=0). The burst end is confirmed "
@@ -107,6 +108,23 @@ DEFAULT_ENDPOINT_DEFINITION = (
     "trip_time_s = t_end - t0. Supersede only by re-versioning AnalysisVersion; "
     "never by editing in place."
 )
+
+V2_ENDPOINT_DEFINITION = (
+    "v2 endpoints: t0 is the K3 close (leakage injection) instant expressed in the "
+    "scope time base, taken from the per-cycle sidecar when available, then from "
+    "the waveform preamble, and otherwise from the detected sustained conduction "
+    "onset. Detected onset refinement must not infer conduction at the record "
+    "boundary solely from a forward-looking envelope. Pre-trigger leakage is "
+    "checked using raw waveform samples so future burst energy cannot contaminate "
+    "the beginning of the record. The burst end is confirmed when the envelope "
+    "(leading half-mains-cycle sliding maximum of |v|) stays below the collapse "
+    "threshold for at least one full mains cycle; t_end is then the last sample "
+    "above the residual floor at or after the final collapse-threshold crossing, "
+    "searched no further than a quarter mains cycle. "
+    "trip_time_s = t_end - t0."
+)
+
+DEFAULT_ENDPOINT_DEFINITION = V2_ENDPOINT_DEFINITION
 
 SANITY_SIGNAL_PRESENT = "signal_present"
 SANITY_NO_PRETRIGGER_LEAKAGE = "no_pretrigger_leakage"
@@ -752,12 +770,16 @@ def analyze_samples(
     *,
     injection_time_s: float | None = None,
 ) -> TripResult:
-    """Version 1 of the trip-time algorithm. Deliberately simple and replayable."""
 
-    if config.algorithm_version is not AnalysisVersion.V1:
+    """Run a registered, replayable version of the trip-time algorithm."""
+
+    if config.algorithm_version not in {
+        AnalysisVersion.V1,
+        AnalysisVersion.V2,
+    }:
         raise NotImplementedError(
             f"No implementation registered for {config.algorithm_version.value}; "
-            "add it here and keep V1 available for replay comparisons"
+            "add it here and keep earlier versions available for replay comparisons"
         )
 
     dt = waveform.sample_interval_s
@@ -806,6 +828,7 @@ def analyze_samples(
             burst_index=onset_index,
             residual_floor=residual_floor,
             window=window,
+            algorithm_version=config.algorithm_version,
         )
 
     t0, t0_source = _resolve_t0(
@@ -827,6 +850,7 @@ def analyze_samples(
         t0=t0,
         on_threshold=on_threshold,
         reference_amplitude_v=ref_amplitude,
+        algorithm_version=config.algorithm_version,
     )
     record_tail_s = waveform.time_of_index(samples.size - 1) - t0
     sanity[SANITY_RECORD_SPANS_NO_TRIP_LIMIT] = record_tail_s + _EPSILON >= config.no_trip_limit_s
@@ -963,6 +987,7 @@ def _refine_start_index(
     burst_index: int,
     residual_floor: float,
     window: int,
+    algorithm_version: AnalysisVersion,
 ) -> int:
     """First conducting sample, recovered from the sub-threshold leading edge.
 
@@ -977,10 +1002,19 @@ def _refine_start_index(
         return max(0, burst_index)
     below = np.flatnonzero(envelope_lead[: burst_index + 1] < residual_floor)
     if below.size == 0:
-        # A forward-looking envelope can include a burst that begins shortly
-        # after the record starts. It therefore cannot prove conduction existed
-        # at the first sample. Preserve the sustained threshold crossing.
+        if algorithm_version is AnalysisVersion.V1:
+            # Historical V1 behavior: assume conduction began at the first
+            # sample when no silent leading-envelope window is available.
+            return 0
+
+        # V2 behavior: a forward-looking envelope can include a burst that
+        # begins shortly after the record starts. It therefore cannot prove
+        # conduction existed at the first sample
+        # V2 behavior: a forward-looking envelope can include a burst that
+        # begins shortly after the record starts. It therefore cannot prove
+        # conduction existed at the first sample.
         return max(0, burst_index)
+
     return int(min(burst_index, below[-1] + window))
 
 
@@ -1015,6 +1049,7 @@ def _pretrigger_leakage_ok(
     t0: float,
     on_threshold: float,
     reference_amplitude_v: float,
+    algorithm_version: AnalysisVersion,
 ) -> bool:
     """False when current was already flowing before injection (K3 stuck closed).
 
@@ -1031,6 +1066,12 @@ def _pretrigger_leakage_ok(
         return False
 
     has_pretrigger_depth = waveform.first_sample_time_s < -guard_s
+
+    if algorithm_version is AnalysisVersion.V1:
+        if not has_pretrigger_depth or envelope_lead.size == 0:
+            return True
+        return not bool(envelope_lead[0] >= on_threshold)
+
     if not has_pretrigger_depth or magnitude.size == 0:
         # No usable pre-trigger data; nothing can be concluded.
         return True

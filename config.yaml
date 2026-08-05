@@ -24,9 +24,9 @@ timing:
   mains_stagger_ms: 0
 
 modes:
-  gpio_mode: sim
-  scope_mode: sim
-  camera_mode: sim
+  gpio_mode: real
+  scope_mode: real
+  camera_mode: real
 
 paths:
   run_root: ./runs
@@ -41,17 +41,20 @@ monitoring:
 # the one this campaign uses. Frozen by the config hash; change it only by
 # introducing a new analysis algorithm_version.
 analysis:
-  algorithm_version: v1
+  algorithm_version: v2
   endpoint_definition: >-
-    v1 endpoints: t0 is the K3 close (leakage injection) instant expressed in the
-    scope time base, taken from the per-cycle sidecar when available and otherwise
-    from the trigger instant (x_origin reference, t=0). The burst end is confirmed
-    when the envelope (leading half-mains-cycle sliding maximum of |v|) stays below
-    the collapse threshold for at least one full mains cycle; t_end is then the last
-    sample above the residual floor at or after the final collapse-threshold
-    crossing, searched no further than a quarter mains cycle.
-    trip_time_s = t_end - t0. Supersede only by re-versioning AnalysisVersion;
-    never by editing in place.
+    v2 endpoints: t0 is the K3 close (leakage injection) instant expressed in the
+    scope time base, taken from the per-cycle sidecar when available, then from
+    the waveform preamble, and otherwise from the detected sustained conduction
+    onset. Detected onset refinement must not infer conduction at the record
+    boundary solely from a forward-looking envelope. Pre-trigger leakage is
+    checked using raw waveform samples so future burst energy cannot contaminate
+    the beginning of the record. The burst end is confirmed when the envelope
+    (leading half-mains-cycle sliding maximum of |v|) stays below the collapse
+    threshold for at least one full mains cycle; t_end is then the last sample
+    above the residual floor at or after the final collapse-threshold crossing,
+    searched no further than a quarter mains cycle.
+    trip_time_s = t_end - t0.
   line_frequency_hz: 60.0
   envelope_window_cycles: 0.5
   envelope_on_fraction: 0.25

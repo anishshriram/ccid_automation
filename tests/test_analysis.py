@@ -41,6 +41,7 @@ from ccid.analysis import (
     sliding_max,
     synthesize_burst_samples,
     synthesize_waveform_npz,
+    V1_ENDPOINT_DEFINITION,
 )
 from ccid.config import load_config
 from ccid.errors import WaveformFormatError
@@ -521,17 +522,21 @@ class WaveformFormatTests(unittest.TestCase):
 
 class VersioningTests(unittest.TestCase):
     def test_results_carry_the_current_algorithm_version(self) -> None:
-        result = analyze_waveform(waveform_bytes(trip_time_s=0.010), CONFIG)
-        self.assertEqual(result.algorithm_version, AnalysisVersion.V1)
-        self.assertEqual(CURRENT_ANALYSIS_VERSION, AnalysisVersion.V1)
-        self.assertEqual(result.algorithm_version.value, "v1")
-        self.assertIn("analysis_version=v1", result.notes)
+        result = analyze_waveform(
+            waveform_bytes(trip_time_s=0.010),
+            CONFIG,
+        )
+
+        self.assertEqual(result.algorithm_version, AnalysisVersion.V2)
+        self.assertEqual(CURRENT_ANALYSIS_VERSION, AnalysisVersion.V2)
+        self.assertEqual(result.algorithm_version.value, "v2")
+        self.assertIn("analysis_version=v2", result.notes)
 
     def test_an_unimplemented_future_version_refuses_to_analyse(self) -> None:
         class FutureVersion(str, Enum):
-            V2 = "v2"
+            V3 = "v3"
 
-        future_config = replace(CONFIG, algorithm_version=FutureVersion.V2)
+        future_config = replace(CONFIG, algorithm_version=FutureVersion.V3)
         waveform = load_waveform(waveform_bytes(trip_time_s=0.010))
         with self.assertRaises(NotImplementedError):
             analyze_samples(waveform, future_config)
@@ -541,7 +546,22 @@ class VersioningTests(unittest.TestCase):
         payload = json.loads(json.dumps(result.to_dict()))
         restored = TripResult.from_dict(payload)
         self.assertEqual(restored, result)
-        self.assertEqual(restored.algorithm_version, AnalysisVersion.V1)
+        self.assertEqual(restored.algorithm_version, AnalysisVersion.V2)
+
+    def test_historical_v1_remains_replayable(self) -> None:
+        v1_config = replace(
+            CONFIG,
+            algorithm_version=AnalysisVersion.V1,
+            endpoint_definition=V1_ENDPOINT_DEFINITION,
+        )
+        result = analyze_waveform(
+            waveform_bytes(trip_time_s=0.010),
+            v1_config,
+        )
+
+        self.assertEqual(result.algorithm_version, AnalysisVersion.V1)
+        self.assertIn("analysis_version=v1", result.notes)
+        self.assertIn("endpoints=v1 endpoints:", result.notes)
 
     def test_malformed_sidecar_payloads_are_rejected(self) -> None:
         with self.assertRaises(WaveformFormatError):
@@ -634,7 +654,7 @@ class AnalysisConfigTests(unittest.TestCase):
     def test_config_yaml_freezes_the_endpoint_definition(self) -> None:
         app_config = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
         self.assertEqual(app_config.analysis.endpoint_definition, DEFAULT_ENDPOINT_DEFINITION)
-        self.assertEqual(app_config.analysis.algorithm_version, AnalysisVersion.V1)
+        self.assertEqual(app_config.analysis.algorithm_version, AnalysisVersion.V2)
         self.assertAlmostEqual(app_config.analysis.pass_limit_s, app_config.timing.pass_limit_s)
         self.assertAlmostEqual(
             app_config.analysis.no_trip_limit_s, app_config.timing.no_trip_limit_s

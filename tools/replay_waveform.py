@@ -37,6 +37,8 @@ from ccid.analysis import (
     TripResult,
     analyze_waveform_file,
     resolve_analysis_config,
+    V1_ENDPOINT_DEFINITION,
+    V2_ENDPOINT_DEFINITION,
 )
 from ccid.config import load_config
 from ccid.errors import WaveformFormatError
@@ -77,7 +79,16 @@ def build_analysis_config(config_path: str | Path, algorithm_version: str | None
     analysis_config = resolve_analysis_config(app_config)
     version = resolve_algorithm_version(algorithm_version)
     if version is not None:
-        analysis_config = replace(analysis_config, algorithm_version=version)
+        endpoint_definition = (
+            V1_ENDPOINT_DEFINITION
+            if version is AnalysisVersion.V1
+            else V2_ENDPOINT_DEFINITION
+        )
+        analysis_config = replace(
+            analysis_config,
+            algorithm_version=version,
+            endpoint_definition=endpoint_definition,
+        )
     return analysis_config
 
 
