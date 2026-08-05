@@ -1,3 +1,14 @@
+"""CLI/lifecycle entrypoint (coding_instructions.txt Phase 10).
+
+`start`/`resume`/`status`/`simulate` subcommands, signal-safe shutdown
+(SIGINT/SIGTERM request a safe stop rather than abandoning the run), systemd
+watchdog/notify integration, and best-effort outbound monitoring (ntfy +
+healthchecks.io) that can never itself halt a campaign - every outbound call
+in `HttpNotifier` logs and swallows failures rather than raising. `SafeOff` is
+invoked on every lifecycle exit via `_execute_campaign`'s `finally` block,
+independent of how the campaign ended.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,14 +20,12 @@ import os
 from pathlib import Path
 import signal
 import socket
-import sys
 import time
 from typing import Callable, Sequence
 from urllib import request as urlrequest
 
 from ccid.config import AppConfig, load_config
-from ccid.errors import ConfigHashMismatchError, PersistenceError, ResumeBlockedError
-from ccid.hal import CameraReal, CameraSim, GpioRealContactorController, GpioSimContactorController, ScopeReal, ScopeSim
+from ccid.hal import CameraReal, CameraRealConfig, CameraSim, GpioRealContactorController, GpioSimContactorController, ScopeReal, ScopeSim
 from ccid.recorder import RunRecorder, RunState
 from ccid.safety import safe_off
 from ccid.sequencer import Sequencer, SequencerRunResult
@@ -87,6 +96,9 @@ class SystemdNotifier:
         self._watchdog_interval_s = None
         if watchdog_usec:
             try:
+                # Ping at half of systemd's configured WatchdogSec, per
+                # systemd's own documented convention - pinging at the full
+                # interval leaves no margin if a single ping is ever late.
                 self._watchdog_interval_s = max(1.0, int(watchdog_usec) / 1_000_000.0 / 2.0)
             except ValueError:
                 self._logger.warning("Invalid WATCHDOG_USEC value; watchdog disabled")
@@ -260,6 +272,7 @@ def build_hal_bundle(
         camera = CameraSim(monotonic_now=monotonic_now, **(camera_sim_kwargs or {}))
     else:
         camera = CameraReal(
+            config=CameraRealConfig(device_index=config.camera.device_index),
             monotonic_now=monotonic_now,
             capture_factory=capture_factory,
             state_classifier=camera_classifier,
@@ -485,6 +498,12 @@ def _execute_campaign(
 
 
 def _finalize_result(notifier: HttpNotifier, result: SequencerRunResult) -> int:
+    # Exit code contract for the systemd unit / operator scripts:
+    #   0 = campaign completed its target cycle count
+    #   2 = DUT no-trip halt
+    #   3 = rig fault halt
+    #   4 = any other halt (persistence/controller/peripheral fault)
+    #   130 = stopped by SIGINT/SIGTERM (see StopRequested in _execute_campaign)
     run_id = result.state.run_id
     if result.terminal is Terminal.COMPLETE:
         notifier.notify_complete(run_id, result.state.target_cycles)

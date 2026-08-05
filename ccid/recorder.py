@@ -1,3 +1,25 @@
+"""Crash-safe per-cycle persistence.
+
+Locked behavior (coding_instructions.txt Phase 5):
+
+- Commit order is mandatory and is what makes a crash mid-cycle recoverable:
+  write and fsync every per-cycle artifact first, then append and fsync the
+  CSV row, then atomically replace `runstate.json`, then send the external
+  heartbeat. A crash at any point along that order leaves the run in a state
+  `reconcile_orphans` can clean up without ever losing or double-counting a
+  cycle: artifacts written but `runstate.json` not yet advanced are orphans
+  (deleted on resume, since `last_completed_cycle` never claimed them);
+  `runstate.json` is never advanced until everything it describes already
+  exists on disk.
+- `runstate.json` itself is written with a temp-file-write + fsync +
+  `os.replace` sequence so a crash mid-write can never leave a torn/partial
+  file in its place - `os.replace` is atomic, so a reader always sees either
+  the old or the new content, never a mix.
+- The heartbeat is sent last, deliberately after every other write has
+  succeeded, so an external liveness ping can never certify a cycle that
+  is not actually durable yet.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
@@ -12,6 +34,7 @@ import tempfile
 from typing import Callable, Mapping
 import zipfile
 
+from ccid import __version__
 from ccid.errors import ConfigHashMismatchError, PersistenceError, ResumeBlockedError
 
 
@@ -174,6 +197,12 @@ class RunRecorder:
         cycle_index = csv_row.cycle_index
         cycle_label = str(cycle_index)
 
+        # Commit order is load-bearing for crash safety (module docstring):
+        # artifacts -> CSV row -> runstate.json -> heartbeat. Each
+        # `_checkpoint()` call is a no-op in production and the hook
+        # `tools/simulate.py`'s crash-resume path uses to prove a crash at
+        # that exact point can always be recovered from without a skipped or
+        # falsely-completed cycle.
         self._write_waveform_npz(
             run_dir / "waveforms" / f"{cycle_label}.npz",
             samples=artifacts.waveform_samples,
@@ -196,6 +225,11 @@ class RunRecorder:
                 "verdict": csv_row.verdict,
                 "analysis_version": csv_row.analysis_version,
                 "led_state_at_gate": csv_row.led_state_at_gate,
+                # Preserved per cycle (not just at the run level in
+                # runstate.json) so an individually-inspected cycle JSON is
+                # self-describing about which software/config produced it.
+                "config_hash": state.config_hash,
+                "software_version": __version__,
             }
         )
         self._write_json_and_fsync(run_dir / "cycles" / f"{cycle_label}.json", sidecar)
@@ -275,6 +309,11 @@ class RunRecorder:
 
     @staticmethod
     def _write_runstate_atomic(path: Path, state: RunState) -> None:
+        # Write-to-temp-file + fsync + os.replace, not an in-place write: a
+        # crash mid-write to `path` directly could leave a truncated/torn
+        # JSON file that a resume can't even parse. `os.replace` is atomic on
+        # POSIX, so any reader always sees either the fully-old or the
+        # fully-new file, never a partial one.
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(asdict(state), sort_keys=True, separators=(",", ":")).encode("utf-8")
         with tempfile.NamedTemporaryFile(

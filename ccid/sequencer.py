@@ -1,3 +1,20 @@
+"""Explicit per-cycle state machine (coding_instructions.txt Phase 8).
+
+Orchestrates the required sequence - mains close, charging gate, scope
+configure/arm/poll, K3 injection, acquisition poll, K3 open/backstop,
+transfer, analysis, commit, mains open, cooldown - plus its retry/degrade/
+halt branches. Safety-critical invariants (K3 interlock, K1/K2 blocked from
+opening while K3 is closed, SafeOff ordering) are enforced one layer down, in
+the HAL (`ccid/hal/gpio_real.py`/`ccid/hal/gpio_sim.py`) and in
+`ccid/safety.py`; this module orchestrates the sequence and cannot bypass
+those checks even if it tried.
+
+Every failure path funnels into one of two internal signal exceptions
+(`_RetryCycle`, `_SequencerHalt`) rather than nested conditionals, so
+`_run_cycle`'s single `try/except` block is the one place that decides
+retry-vs-halt-vs-continue for the whole state machine.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
@@ -5,6 +22,7 @@ from enum import Enum
 import io
 import json
 import logging
+import shutil
 import zipfile
 from typing import Callable
 
@@ -28,7 +46,6 @@ from ccid.errors import CcidError, PersistenceError
 from ccid.hal.base import (
     ChargingGateToken,
     ContactorInterface,
-    ContactorName,
     ScopeInterface,
     ScopeSettings,
 )
@@ -110,6 +127,10 @@ class Sequencer:
         scope_settings: ScopeSettings | None = None,
         monotonic_now: Callable[[], float],
         sleep: Callable[[float], None],
+        # Duck-typed to whatever shutil.disk_usage() returns (only `.free` is
+        # used); injectable so low-disk conditions are testable without an
+        # actual near-full filesystem.
+        disk_usage: Callable[[str], object] = shutil.disk_usage,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
@@ -131,6 +152,7 @@ class Sequencer:
         self._scope_settings = scope_settings or ScopeSettings()
         self._now = monotonic_now
         self._sleep = sleep
+        self._disk_usage = disk_usage
         self._logger = logger or _LOGGER
 
     def run(self, *, run_dir, state: RunState) -> SequencerRunResult:
@@ -192,7 +214,7 @@ class Sequencer:
 
         while True:
             try:
-                self._attempt_cycle(context)
+                self._attempt_cycle(context, run_dir=run_dir)
             except _RetryCycle as retry:
                 if retry_used:
                     execution = self._halt_without_capture(
@@ -319,8 +341,10 @@ class Sequencer:
         )
         return execution, next_state, context.transitions
 
-    def _attempt_cycle(self, context: _CycleContext) -> None:
+    def _attempt_cycle(self, context: _CycleContext, *, run_dir) -> None:
         cycle_index = context.cycle_index
+        self._assert_sufficient_disk_space(run_dir)
+
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.SAFE_OFF, detail="cycle_start")
         safe_off(self._contactors)
 
@@ -407,6 +431,14 @@ class Sequencer:
         return False
 
     def _poll_acquisition_with_backstop(self, *, context: _CycleContext, k3_closed_s: float) -> bool:
+        # K3's 300 ms hard backstop (handoff safety invariant 9) must fire on
+        # its own deadline even if the scope's acquisition-complete poll is
+        # itself blocking (a scope that never returns from
+        # wait_until_acquisition_complete must not keep leakage injection
+        # closed indefinitely). `opened` is a single-fire latch so the
+        # backstop path and the normal/timeout paths below - which can each
+        # independently decide to open K3 - never issue a second, redundant
+        # open_k3() for the same cycle.
         start_s = self._now()
         acq_timeout_s = self._config.timing.scope_acquisition_timeout_s
         k3_deadline = k3_closed_s + self._config.timing.k3_backstop_s
@@ -445,6 +477,20 @@ class Sequencer:
             )
             self._contactors.open_k3()
         return False
+
+    def _assert_sufficient_disk_space(self, run_dir) -> None:
+        """Fault-matrix row: halt before energizing anything if the run/output
+        filesystem is critically low, rather than commanding mains and
+        injection for a cycle whose artifacts might not fit."""
+
+        free_bytes = self._disk_usage(str(run_dir)).free
+        min_free_bytes = self._config.paths.min_free_disk_gb * 1024**3
+        if free_bytes < min_free_bytes:
+            raise _SequencerHalt(
+                terminal=Terminal.HALTED,
+                category=FaultCategory.PERSISTENCE,
+                reason="insufficient_disk_space",
+            )
 
     def _assert_no_mains_mismatch(self) -> None:
         if self._contactors.detect_mains_command_mismatch(
@@ -646,6 +692,16 @@ class Sequencer:
 
 @dataclass(frozen=True)
 class _SequencerHalt(Exception):
+    """Internal control-flow signal, not an error condition.
+
+    Raised from deep inside `_attempt_cycle` to unwind straight to
+    `_run_cycle`'s single `except _SequencerHalt` handler, carrying exactly
+    the terminal/category/reason that handler needs - the alternative would
+    be threading a halt decision back up through every intermediate call as a
+    return value, which is exactly the "ad hoc chain of nested conditionals"
+    Phase 8 explicitly rules out.
+    """
+
     terminal: Terminal
     category: FaultCategory
     reason: str
@@ -653,6 +709,9 @@ class _SequencerHalt(Exception):
 
 @dataclass(frozen=True)
 class _RetryCycle(Exception):
+    """Internal control-flow signal for the one-shot vision-gate retry
+    (blinking-red-then-clears). Same rationale as `_SequencerHalt`."""
+
     reason: str
 
 

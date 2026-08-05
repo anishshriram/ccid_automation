@@ -17,6 +17,12 @@ vision:
   charging_green_window_s: 2.0
   charging_green_required_frames: 3
 
+camera:
+  # Which /dev/videoN the Logitech C270 enumerates as on this Pi. Deployment-
+  # specific (depends on what else is plugged in), unlike VISA backend or
+  # GPIO pin numbers, so it lives in config rather than staying hardcoded.
+  device_index: 0
+
 timing:
   cooldown_s: 10
   cooldown_retry_s: 60
@@ -37,6 +43,9 @@ modes:
 paths:
   run_root: ./runs
   output_root: ./runs
+  # Fault-matrix row: halt (persistence fault) rather than risk a partial
+  # artifact write if free space on the run/output filesystem drops below this.
+  min_free_disk_gb: 2
 
 monitoring:
   heartbeat_url_env: CCID_HEALTHCHECKS_URL

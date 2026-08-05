@@ -73,6 +73,9 @@ class CameraReal(CameraInterface):
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self._cfg.height))
             cap.set(cv2.CAP_PROP_FPS, float(self._cfg.fps))
         else:
+            # A test-injected capture_factory stands in for the whole camera,
+            # so there is no real cv2.VideoCapture to configure width/height/
+            # fps on here - intentionally skipped, not an oversight.
             cap = self._capture_factory(self._cfg.device_index)
 
         if not cap or not cap.isOpened():

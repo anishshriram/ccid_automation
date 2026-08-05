@@ -81,6 +81,8 @@ class MainTests(unittest.TestCase):
                   roi_height: 16
                   charging_green_window_s: 2.0
                   charging_green_required_frames: 3
+                camera:
+                  device_index: 0
                 timing:
                   cooldown_s: 0.01
                   cooldown_retry_s: 0.02
@@ -99,6 +101,7 @@ class MainTests(unittest.TestCase):
                 paths:
                   run_root: {self.root / 'runs'}
                   output_root: {self.root / 'runs'}
+                  min_free_disk_gb: 2
                 monitoring:
                   heartbeat_url_env: CCID_HEALTHCHECKS_URL
                 """

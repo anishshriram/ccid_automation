@@ -1,3 +1,16 @@
+"""Strict configuration loading, validation, and hash-freezing.
+
+Every section is validated against an explicit key set (`_reject_unknown_keys`)
+and built into a frozen `AppConfig` - unknown keys, missing required keys, and
+out-of-range values all fail loudly at load time rather than surfacing later
+as a mysterious runtime default. `AppConfig.canonical_hash()` is the other
+half of the contract: it's computed from a canonical (key-order-independent)
+JSON payload of the loaded config and is what `RunRecorder`/`Sequencer` use to
+detect a run being resumed against a silently different configuration, so a
+new required field belongs in this hash unless there's a specific reason it
+shouldn't be (see `_canonical_for_hash`).
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -26,12 +39,13 @@ _TOP_LEVEL_KEYS = frozenset(
     {
         "schema_version",
         "gpio",
-	"vision",
+        "vision",
+        "camera",
         "timing",
         "modes",
         "paths",
         "monitoring",
-        "analysis"
+        "analysis",
     }
 )
 _GPIO_KEYS = frozenset({"k1", "k2", "k3"})
@@ -61,7 +75,8 @@ _TIMING_KEYS = frozenset(
 )
 _MODES_KEYS = frozenset({"gpio_mode", "scope_mode", "camera_mode"})
 _SUPPORTED_GPIO_MODES = frozenset({"real", "sim"})
-_PATHS_KEYS = frozenset({"run_root", "output_root"})
+_PATHS_KEYS = frozenset({"run_root", "output_root", "min_free_disk_gb"})
+_CAMERA_KEYS = frozenset({"device_index"})
 _MONITORING_KEYS = frozenset({"heartbeat_url_env"})
 _ANALYSIS_KEYS = frozenset(
     {
@@ -118,6 +133,7 @@ class ModesConfig:
 class PathsConfig:
     run_root: Path
     output_root: Path
+    min_free_disk_gb: int
 
 
 @dataclass(frozen=True)
@@ -134,11 +150,18 @@ class VisionConfig:
     charging_green_window_s: float
     charging_green_required_frames: int
 
+
+@dataclass(frozen=True)
+class CameraHardwareConfig:
+    device_index: int
+
+
 @dataclass(frozen=True)
 class AppConfig:
     schema_version: int
     gpio: GpioConfig
     vision: VisionConfig
+    camera: CameraHardwareConfig
     timing: TimingConfig
     modes: ModesConfig
     paths: PathsConfig
@@ -183,6 +206,7 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
     schema_version = _require_int(raw, "schema_version", minimum=1)
     gpio_map = _require_mapping(raw, "gpio")
     vision_map = _require_mapping(raw, "vision")
+    camera_map = _require_mapping(raw, "camera")
     timing_map = _require_mapping(raw, "timing")
     modes_map = _require_mapping(raw, "modes")
     paths_map = _require_mapping(raw, "paths")
@@ -190,6 +214,7 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
 
     _reject_unknown_keys("gpio", gpio_map, _GPIO_KEYS)
     _reject_unknown_keys("vision", vision_map, _VISION_KEYS)
+    _reject_unknown_keys("camera", camera_map, _CAMERA_KEYS)
     _reject_unknown_keys("timing", timing_map, _TIMING_KEYS)
     _reject_unknown_keys("modes", modes_map, _MODES_KEYS)
     _reject_unknown_keys("paths", paths_map, _PATHS_KEYS)
@@ -212,6 +237,10 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
         charging_green_required_frames=_require_int(
             vision_map, "charging_green_required_frames", minimum=1
         ),
+    )
+
+    camera = CameraHardwareConfig(
+        device_index=_require_int(camera_map, "device_index", minimum=0),
     )
 
     timing = TimingConfig(
@@ -254,7 +283,8 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
 
     run_root = _require_non_empty_path(paths_map, "run_root")
     output_root = _require_non_empty_path(paths_map, "output_root")
-    paths = PathsConfig(run_root=run_root, output_root=output_root)
+    min_free_disk_gb = _require_int(paths_map, "min_free_disk_gb", minimum=1)
+    paths = PathsConfig(run_root=run_root, output_root=output_root, min_free_disk_gb=min_free_disk_gb)
 
     heartbeat_url_env = monitoring_map.get("heartbeat_url_env")
     if heartbeat_url_env is not None:
@@ -271,7 +301,8 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
     return AppConfig(
         schema_version=schema_version,
         gpio=gpio,
-	vision=vision,
+        vision=vision,
+        camera=camera,
         timing=timing,
         modes=modes,
         paths=paths,
@@ -358,6 +389,7 @@ def _canonical_for_hash(config: AppConfig) -> dict[str, Any]:
         "schema_version": raw["schema_version"],
         "gpio": raw["gpio"],
         "vision": raw["vision"],
+        "camera": raw["camera"],
         "timing": raw["timing"],
         "modes": raw["modes"],
         # The endpoint definition is part of the frozen campaign contract.
@@ -365,6 +397,7 @@ def _canonical_for_hash(config: AppConfig) -> dict[str, Any]:
         "paths": {
             "run_root": str(config.paths.run_root),
             "output_root": str(config.paths.output_root),
+            "min_free_disk_gb": config.paths.min_free_disk_gb,
         },
         # Keep only environment variable name in canonical hash; never secret value.
         "monitoring": {"heartbeat_url_env": config.monitoring.heartbeat_url_env},
