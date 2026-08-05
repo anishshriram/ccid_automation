@@ -977,8 +977,10 @@ def _refine_start_index(
         return max(0, burst_index)
     below = np.flatnonzero(envelope_lead[: burst_index + 1] < residual_floor)
     if below.size == 0:
-        # Already conducting at the first sample of the record.
-        return 0
+        # A forward-looking envelope can include a burst that begins shortly
+        # after the record starts. It therefore cannot prove conduction existed
+        # at the first sample. Preserve the sustained threshold crossing.
+        return max(0, burst_index)
     return int(min(burst_index, below[-1] + window))
 
 
@@ -1029,10 +1031,32 @@ def _pretrigger_leakage_ok(
         return False
 
     has_pretrigger_depth = waveform.first_sample_time_s < -guard_s
-    if not has_pretrigger_depth or envelope_lead.size == 0:
+    if not has_pretrigger_depth or magnitude.size == 0:
         # No usable pre-trigger data; nothing can be concluded.
         return True
-    return not bool(envelope_lead[0] >= on_threshold)
+
+    # Inspect only raw samples at the beginning of the record. Do not use the
+    # leading envelope here because it includes future samples and can make a
+    # later burst appear to have been present at the record boundary.
+
+    if t0 <= waveform.first_sample_time_s + _EPSILON:
+        # Detected conduction begins at the record boundary. Inspect the first
+        # quarter cycle directly so genuine stuck-K3 conduction is not hidden
+        # by an empty pre-t0 slice.
+        initial_probe_end_s = (
+            waveform.first_sample_time_s + 0.25 * config.mains_period_s
+        )
+    else:
+        initial_probe_end_s = min(
+            t0,
+            waveform.first_sample_time_s + 0.25 * config.mains_period_s,
+        )
+    initial_probe_end = waveform.index_of_time(initial_probe_end_s)
+    return check_no_pretrigger_leakage(
+        magnitude[:initial_probe_end],
+        config,
+        reference_amplitude_v=reference_amplitude_v,
+    )
 
 
 def _decide(

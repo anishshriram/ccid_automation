@@ -277,6 +277,29 @@ class SanityCheckTests(unittest.TestCase):
         result = analyze_waveform(waveform_bytes(trip_time_s=0.015), CONFIG)
         self.assertTrue(result.sanity_checks[SANITY_NO_PRETRIGGER_LEAKAGE])
 
+    def test_quiet_record_start_before_early_burst_is_not_pretrigger_leakage(self) -> None:
+        samples, preamble = synthesize_burst_samples(
+            pretrigger_s=0.020,
+            record_after_t0_s=0.180,
+            trip_time_s=0.015,
+        )
+
+        dt = float(preamble["x_increment"])
+        times = float(preamble["x_origin"]) + np.arange(samples.size) * dt
+        burst = 170.0 * np.sin(2.0 * np.pi * 60.0 * times)
+        samples = np.where(
+            (times >= -0.015) & (times <= 0.0),
+            burst,
+            0.0,
+        )
+
+        result = analyze_waveform(pack_waveform_npz(samples, preamble), CONFIG)
+
+        self.assertTrue(result.sanity_checks[SANITY_NO_PRETRIGGER_LEAKAGE])
+        self.assertIn("t0_source=detected_onset", result.notes)
+        self.assertNotIn("t0_s=-0.020000000", result.notes)
+        self.assertAlmostEqual(result.trip_time_s, 0.015, delta=CLEAN_TOLERANCE_S)
+
     def test_leakage_helper_scales_with_the_burst_amplitude(self) -> None:
         probe_noise = np.full(1000, 2.0)
         self.assertFalse(check_no_pretrigger_leakage(probe_noise, CONFIG))
