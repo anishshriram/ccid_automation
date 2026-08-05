@@ -79,6 +79,8 @@ class MainTests(unittest.TestCase):
                   roi_y: 0
                   roi_width: 16
                   roi_height: 16
+                  charging_green_window_s: 2.0
+                  charging_green_required_frames: 3
                 timing:
                   cooldown_s: 0.01
                   cooldown_retry_s: 0.02

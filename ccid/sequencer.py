@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import io
 import json
@@ -16,6 +16,7 @@ from ccid.analysis import (
     analyze_waveform,
 )
 from ccid.classify import (
+    DEFAULT_OPTICAL_CONFIG,
     DEGRADED_FLAG_CAMERA_UNAVAILABLE,
     GateTimeoutAction,
     RegionOfInterest,
@@ -120,6 +121,11 @@ class Sequencer:
             y=config.vision.roi_y,
             width=config.vision.roi_width,
             height=config.vision.roi_height,
+        )
+        self._vision_optical_config = replace(
+            DEFAULT_OPTICAL_CONFIG,
+            charging_green_window_s=config.vision.charging_green_window_s,
+            charging_green_required_frames=config.vision.charging_green_required_frames,
         )
         self._recorder = recorder
         self._scope_settings = scope_settings or ScopeSettings()
@@ -333,6 +339,7 @@ class Sequencer:
             roi=self._vision_roi,
             timeout_s=self._config.timing.boot_timeout_s,
             degraded_flag_out=context.degraded_flags,
+            config=self._vision_optical_config,
             monotonic=self._now,
             sleep=self._sleep,
             logger=self._logger,

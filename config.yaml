@@ -10,6 +10,12 @@ vision:
   roi_y: 120
   roi_width: 450
   roi_height: 350
+  # Charging-gate grant policy (ccid.classify.ChargingGatePolicy): grant once
+  # this many confidently-green frames are seen within this rolling window.
+  # Starting values, not locked - validate against real C270 frame rate and
+  # actual EVSE flash cadence.
+  charging_green_window_s: 2.0
+  charging_green_required_frames: 3
 
 timing:
   cooldown_s: 10

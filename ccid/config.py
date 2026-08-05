@@ -35,7 +35,16 @@ _TOP_LEVEL_KEYS = frozenset(
     }
 )
 _GPIO_KEYS = frozenset({"k1", "k2", "k3"})
-_VISION_KEYS = frozenset({"roi_x", "roi_y", "roi_width", "roi_height"})
+_VISION_KEYS = frozenset(
+    {
+        "roi_x",
+        "roi_y",
+        "roi_width",
+        "roi_height",
+        "charging_green_window_s",
+        "charging_green_required_frames",
+    }
+)
 _TIMING_KEYS = frozenset(
     {
         "cooldown_s",
@@ -122,6 +131,8 @@ class VisionConfig:
     roi_y: int
     roi_width: int
     roi_height: int
+    charging_green_window_s: float
+    charging_green_required_frames: int
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -197,6 +208,10 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
         roi_y=_require_int(vision_map, "roi_y", minimum=0),
         roi_width=_require_int(vision_map, "roi_width", minimum=1),
         roi_height=_require_int(vision_map, "roi_height", minimum=1),
+        charging_green_window_s=_require_float(vision_map, "charging_green_window_s", positive=True),
+        charging_green_required_frames=_require_int(
+            vision_map, "charging_green_required_frames", minimum=1
+        ),
     )
 
     timing = TimingConfig(

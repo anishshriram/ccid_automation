@@ -9,6 +9,9 @@ import numpy as np
 from ccid.classify import (
     DEFAULT_OPTICAL_CONFIG,
     DEGRADED_FLAG_CAMERA_UNAVAILABLE,
+    LED_FIXTURE_RGB,
+    ChargingGatePolicy,
+    FrameClassification,
     GateTimeoutAction,
     HueRange,
     LedClassifier,
@@ -138,6 +141,17 @@ class _FixtureCamera(CameraInterface):
 
 def _steady_sequence(color: LedColor, count: int) -> list[np.ndarray]:
     return [make_led_frame(color) for _ in range(count)]
+
+
+def _green_frame_with_red_fleck(width: int = 16, height: int = 16) -> np.ndarray:
+    """A mostly-green frame with a small spurious red patch, modeling the
+    kind of transient camera noise/glare that can tip a real flashing-green
+    LED capture into a second hue for a couple of frames."""
+
+    frame = make_led_frame(LedColor.GREEN, width=width, height=height).copy()
+    patch_rows = max(1, int(round(height * 0.05)))
+    frame[:patch_rows, :, :] = np.array(LED_FIXTURE_RGB[LedColor.RED], dtype=np.uint8)
+    return frame
 
 
 class HsvConversionTests(unittest.TestCase):
@@ -455,7 +469,13 @@ class ChargingGateTests(unittest.TestCase):
         self.assertEqual(self.flags, [])
         self.assertLess(self.clock.total_slept_s, 20.0)
 
-    def test_happy_path_with_default_three_second_window(self) -> None:
+    def test_happy_path_grants_fast_under_default_config(self) -> None:
+        """Grant timing is governed by `ChargingGatePolicy`
+        (charging_green_window_s/charging_green_required_frames), not by the
+        window classifier's 3 s/5-agreement consensus used for timeout
+        diagnostics — so a clean green flash grants in a couple of frames,
+        not several seconds."""
+
         frames = make_blinking_sequence(
             LedColor.GREEN, frame_count=400, on_frames=7, off_frames=7
         )
@@ -466,9 +486,48 @@ class ChargingGateTests(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(led_state, LedState.CHARGING)
         self.assertFalse(degraded)
-        # 3 s window plus 5 agreeing frames at 15 fps.
-        self.assertGreaterEqual(self.clock.total_slept_s, 3.0)
-        self.assertLess(self.clock.total_slept_s, 6.0)
+        # Grants after charging_green_required_frames (3) green frames, i.e.
+        # after 2 intervening sleeps.
+        expected_min = 2 * DEFAULT_OPTICAL_CONFIG.frame_interval_s
+        self.assertGreaterEqual(self.clock.total_slept_s, expected_min - 1e-9)
+        self.assertLess(self.clock.total_slept_s, 1.0)
+
+    def test_transient_spurious_hue_frames_do_not_block_a_genuine_green_flash(self) -> None:
+        """Regression for the live-hardware failure: a couple of frames with a
+        small spurious secondary hue (camera noise/glare) must not prevent the
+        gate from granting on an otherwise-clean flashing-green sequence.
+        The OLD grant condition (`stable_color == GREEN`, declared by the
+        window classifier) could be tipped into a window-level BOOTING
+        verdict by exactly this kind of transient noise; `ChargingGatePolicy`
+        only cares about recent green-frame density and is blocked only by
+        red, so it recovers within the same on-phase run."""
+
+        frames = list(
+            make_blinking_sequence(LedColor.GREEN, frame_count=200, on_frames=7, off_frames=7)
+        )
+        frames[0] = _green_frame_with_red_fleck()
+        frames[1] = _green_frame_with_red_fleck()
+        camera = _FixtureCamera(frames)
+        success, led_state, degraded = self._run_gate(
+            camera, timeout_s=10.0, config=DEFAULT_OPTICAL_CONFIG
+        )
+        self.assertTrue(success)
+        self.assertEqual(led_state, LedState.CHARGING)
+        self.assertFalse(degraded)
+
+    def test_red_then_small_amount_of_green_does_not_immediately_grant(self) -> None:
+        # Fewer green frames than charging_green_required_frames (3), then
+        # back to red, so the fixture's clamp-on-last-frame behavior doesn't
+        # turn this into an unbounded green repeat.
+        frames = (
+            _steady_sequence(LedColor.RED, 5)
+            + _steady_sequence(LedColor.GREEN, 2)
+            + _steady_sequence(LedColor.RED, 50)
+        )
+        camera = _FixtureCamera(frames)
+        success, led_state, degraded = self._run_gate(camera, timeout_s=1.0)
+        self.assertFalse(success)
+        self.assertFalse(degraded)
 
     def test_timeout_with_blinking_red_reports_faulted_and_requests_retry(self) -> None:
         frames = make_blinking_sequence(LedColor.RED, frame_count=200, on_frames=4, off_frames=4)
@@ -558,6 +617,102 @@ class ChargingGateTests(unittest.TestCase):
                 monotonic=self.clock.monotonic,
                 sleep=self.clock.sleep,
             )
+
+
+class ChargingGatePolicyTests(unittest.TestCase):
+    """Direct unit tests of `ChargingGatePolicy`, independent of the camera/
+    polling loop and of the (unchanged) window-classifier consensus logic."""
+
+    def setUp(self) -> None:
+        self.config = LedOpticalConfig(charging_green_window_s=2.0, charging_green_required_frames=3)
+        self.policy = ChargingGatePolicy(self.config)
+        self.classifier = LedClassifier(self.config)
+
+    def _detail(self, color: LedColor) -> FrameClassification:
+        return self.classifier.classify_frame_detailed(make_led_frame(color))
+
+    def test_continuous_green_grants_after_required_frames(self) -> None:
+        detail = self._detail(LedColor.GREEN)
+        granted = [self.policy.record(1000.0 + i * 0.1, detail) for i in range(5)]
+        self.assertEqual(granted, [False, False, True, True, True])
+
+    def test_green_dark_flashing_grants(self) -> None:
+        green = self._detail(LedColor.GREEN)
+        off = self._detail(LedColor.OFF)
+        sequence = [green, off, green, off, green]
+        granted = [self.policy.record(1000.0 + i * 0.1, detail) for i, detail in enumerate(sequence)]
+        self.assertTrue(granted[-1])
+
+    def test_dark_frames_do_not_erase_green_evidence(self) -> None:
+        green = self._detail(LedColor.GREEN)
+        off = self._detail(LedColor.OFF)
+        self.policy.record(1000.0, green)
+        self.policy.record(1000.1, off)
+        self.policy.record(1000.2, off)
+        self.policy.record(1000.3, green)
+        self.assertTrue(self.policy.record(1000.4, green))
+
+    def test_continuous_blue_never_grants(self) -> None:
+        detail = self._detail(LedColor.BLUE)
+        granted = False
+        for i in range(20):
+            granted = self.policy.record(1000.0 + i * 0.1, detail)
+        self.assertFalse(granted)
+
+    def test_continuous_red_never_grants(self) -> None:
+        detail = self._detail(LedColor.RED)
+        granted = False
+        for i in range(20):
+            granted = self.policy.record(1000.0 + i * 0.1, detail)
+        self.assertFalse(granted)
+
+    def test_off_never_grants(self) -> None:
+        detail = self._detail(LedColor.OFF)
+        granted = False
+        for i in range(20):
+            granted = self.policy.record(1000.0 + i * 0.1, detail)
+        self.assertFalse(granted)
+
+    def test_single_green_frame_below_required_does_not_grant(self) -> None:
+        self.assertFalse(self.policy.record(1000.0, self._detail(LedColor.GREEN)))
+
+    def test_red_clears_accumulated_green_evidence(self) -> None:
+        green = self._detail(LedColor.GREEN)
+        red = self._detail(LedColor.RED)
+        self.policy.record(1000.0, green)
+        self.policy.record(1000.1, green)
+        self.assertFalse(self.policy.record(1000.2, red))
+        # Evidence must re-accumulate from zero, not resume at 2.
+        self.assertFalse(self.policy.record(1000.3, green))
+        self.assertFalse(self.policy.record(1000.4, green))
+        self.assertTrue(self.policy.record(1000.5, green))
+
+    def test_multi_hue_frame_with_red_present_clears_even_when_not_the_dominant_color(self) -> None:
+        """A per-frame BOOTING classification (>=2 hues present) that includes
+        red must still clear/block, via `hues_present`, not `.color`."""
+
+        green = self._detail(LedColor.GREEN)
+        booting_with_red = self.classifier.classify_frame_detailed(_green_frame_with_red_fleck())
+        self.policy.record(1000.0, green)
+        self.policy.record(1000.1, green)
+        self.assertFalse(self.policy.record(1000.2, booting_with_red))
+        self.assertFalse(self.policy.record(1000.3, green))
+        self.assertFalse(self.policy.record(1000.4, green))
+        self.assertTrue(self.policy.record(1000.5, green))
+
+    def test_green_evidence_expires_outside_window(self) -> None:
+        detail = self._detail(LedColor.GREEN)
+        self.policy.record(1000.0, detail)
+        self.policy.record(1000.1, detail)
+        after_window = 1000.0 + self.config.charging_green_window_s + 0.5
+        self.assertFalse(self.policy.record(after_window, detail))
+
+    def test_reset_clears_accumulated_evidence(self) -> None:
+        detail = self._detail(LedColor.GREEN)
+        self.policy.record(1000.0, detail)
+        self.policy.record(1000.1, detail)
+        self.policy.reset()
+        self.assertFalse(self.policy.record(1000.2, detail))
 
 
 class GateTimeoutActionTests(unittest.TestCase):

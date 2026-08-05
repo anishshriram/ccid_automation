@@ -158,6 +158,11 @@ class LedOpticalConfig:
     max_consecutive_dropped_frames: int = 15
     degraded_fixed_wait_s: float = 60.0
     gate_timeout_s: float = 90.0
+    # Charging-gate grant policy (ChargingGatePolicy): recent-green-evidence
+    # window, deliberately independent of the window-classifier's
+    # consecutive-agreement machinery above (see await_charging_gate).
+    charging_green_window_s: float = 2.0
+    charging_green_required_frames: int = 3
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.min_saturation <= 1.0:
@@ -186,6 +191,10 @@ class LedOpticalConfig:
             raise ValueError("gate_timeout_s must be > 0")
         if self.window_frames < self.consecutive_agreement_frames:
             raise ValueError("window must hold at least consecutive_agreement_frames frames")
+        if self.charging_green_window_s <= 0.0:
+            raise ValueError("charging_green_window_s must be > 0")
+        if self.charging_green_required_frames < 1:
+            raise ValueError("charging_green_required_frames must be >= 1")
 
     @property
     def window_frames(self) -> int:
@@ -315,6 +324,7 @@ class LedClassifier:
         self._consecutive_dropped = 0
         self._dropped_total = 0
         self._frames_observed = 0
+        self._last_frame_detail: FrameClassification | None = None
 
     # -- state accessors -------------------------------------------------
 
@@ -348,6 +358,13 @@ class LedClassifier:
     def camera_failed(self) -> bool:
         return self._consecutive_dropped >= self.config.max_consecutive_dropped_frames
 
+    @property
+    def last_frame_detail(self) -> FrameClassification | None:
+        """The most recent per-frame classification fed to `observe()`, or `None`
+        if the last call dropped (no frame, or classification raised)."""
+
+        return self._last_frame_detail
+
     def reset(self) -> None:
         self._window.clear()
         self._pending_color = None
@@ -356,6 +373,7 @@ class LedClassifier:
         self._consecutive_dropped = 0
         self._dropped_total = 0
         self._frames_observed = 0
+        self._last_frame_detail = None
 
     # -- classification --------------------------------------------------
 
@@ -460,6 +478,7 @@ class LedClassifier:
         self._consecutive_dropped = 0
         self._frames_observed += 1
         self._window.append(detail)
+        self._last_frame_detail = detail
         return self._update_agreement()
 
     def observe_dropped(self) -> WindowClassification:
@@ -467,6 +486,7 @@ class LedClassifier:
 
         self._consecutive_dropped += 1
         self._dropped_total += 1
+        self._last_frame_detail = None
         return self.window_classification()
 
     def window_classification(self) -> WindowClassification:
@@ -564,6 +584,49 @@ class LedClassifier:
         return led_state_for_color(self.window_classification().color)
 
 
+class ChargingGatePolicy:
+    """Recent-green-evidence charging-gate grant policy.
+
+    Deliberately independent of `LedClassifier`'s window/consecutive-agreement
+    machinery, which still governs the FAULTED/READY/OFF_OR_UNKNOWN/BOOTING
+    diagnostic state reported at gate timeout. That window can be tipped into
+    BOOTING by an isolated, low-pixel-fraction stray hue (camera noise/glare)
+    landing in just `window_hue_min_frames` frames anywhere across a ~3 s/45
+    frame history, which incorrectly denies a genuinely charging (flashing
+    green) LED. This policy instead grants on recent green-frame density
+    alone, blocked only by red, so an isolated non-green frame cannot deny a
+    real green flash.
+    """
+
+    def __init__(self, config: LedOpticalConfig) -> None:
+        self.config = config
+        self._green_timestamps: deque[float] = deque()
+
+    def reset(self) -> None:
+        self._green_timestamps.clear()
+
+    def record(self, now_s: float, detail: FrameClassification) -> bool:
+        """Feed one frame's classification. Returns True once the gate should grant."""
+
+        window_start = now_s - self.config.charging_green_window_s
+        while self._green_timestamps and self._green_timestamps[0] < window_start:
+            self._green_timestamps.popleft()
+
+        # Broad check (hues_present, not just the collapsed .color): red must
+        # block/clear evidence even from a frame the per-frame classifier
+        # already called BOOTING because red coexisted with another hue.
+        if LedColor.RED in detail.hues_present:
+            self._green_timestamps.clear()
+            return False
+
+        # Narrow check: only a frame where green is the frame's dominant/sole
+        # classification counts as evidence, not merely "green present".
+        if detail.color == LedColor.GREEN:
+            self._green_timestamps.append(now_s)
+
+        return len(self._green_timestamps) >= self.config.charging_green_required_frames
+
+
 def gate_timeout_action(led_state: LedState) -> tuple[GateTimeoutAction, str]:
     """Map the LED state observed at gate timeout onto the required response."""
 
@@ -590,6 +653,7 @@ def await_charging_gate(
     degraded_flag_out: MutableSequence[str] | None = None,
     config: LedOpticalConfig | None = None,
     classifier: LedClassifier | None = None,
+    gate_policy: ChargingGatePolicy | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     logger: logging.Logger | None = None,
@@ -598,8 +662,10 @@ def await_charging_gate(
 
     Returns `(success, led_state, degraded)`.
 
-    - success: a stable charging (blinking green) state was declared.
-    - led_state: the LED state observed at the moment of timeout, used by the
+    - success: `gate_policy` (recent-green-evidence, see `ChargingGatePolicy`)
+      granted the gate.
+    - led_state: the LED state observed at the moment of timeout (from the
+      independent window/consecutive-agreement classifier), used by the
       sequencer to pick between extended-cooldown retry and immediate halt.
     - degraded: the camera became unavailable, a fixed wait was applied instead,
       and the run continues in logged degraded mode.
@@ -614,6 +680,8 @@ def await_charging_gate(
     if classifier is not None and roi is not None:
         active.roi = roi
     active.reset()
+    policy = gate_policy if gate_policy is not None else ChargingGatePolicy(effective_config)
+    policy.reset()
 
     interval = effective_config.frame_interval_s
     start_s = monotonic()
@@ -624,6 +692,7 @@ def await_charging_gate(
             break
 
         camera_lost = False
+        granted = False
         try:
             sample = camera.sample_state(now_s)
         except Exception as exc:  # noqa: BLE001 - vision must never kill the run
@@ -645,6 +714,9 @@ def await_charging_gate(
                     active.observe_dropped()
                 else:
                     active.observe(rgb)
+                    detail = active.last_frame_detail
+                    if detail is not None:
+                        granted = policy.record(now_s, detail)
 
         if camera_lost or active.camera_failed:
             return _degrade_to_fixed_wait(
@@ -654,7 +726,7 @@ def await_charging_gate(
                 log=log,
             )
 
-        if active.stable_color == LedColor.GREEN:
+        if granted:
             log.info("Charging gate granted by vision after %.2f s", monotonic() - start_s)
             return ChargingGateResult(True, LedState.CHARGING, False)
 
@@ -856,6 +928,7 @@ def frames_to_bgr_bytes(frame_rgb: np.ndarray) -> bytes:
 __all__ = [
     "DEFAULT_OPTICAL_CONFIG",
     "DEGRADED_FLAG_CAMERA_UNAVAILABLE",
+    "ChargingGatePolicy",
     "ChargingGateResult",
     "FrameClassification",
     "GateTimeoutAction",

@@ -6,6 +6,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
+
 from ccid.classify import LedColor, frames_to_bgr_bytes, make_led_frame
 from ccid.config import AppConfig, TimingConfig, VisionConfig, load_config
 from ccid.hal.base import CameraFrame, CameraHealth, CameraStateSample, ContactorName
@@ -103,6 +105,48 @@ class _BlockingNeverTriggeredScope(ScopeSim):
         self._clock.sleep(timeout_s)
         return False
 
+class _TwoHueCamera:
+    """Always returns a genuinely two-hue (blue+red) frame, exercising the
+    real per-frame >=2-hues BOOTING classification directly rather than
+    relying on `_ScriptedCamera`'s `BOOTING -> solid blue` label mapping
+    (which does not itself produce a multi-hue frame)."""
+
+    def __init__(self) -> None:
+        self._latest_frame: CameraFrame | None = None
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def sample_state(self, now_monotonic_s: float) -> CameraStateSample:
+        top = make_led_frame(LedColor.BLUE, width=8, height=4)
+        bottom = make_led_frame(LedColor.RED, width=8, height=4)
+        rgb = np.concatenate([top, bottom], axis=0)
+        frame = CameraFrame(
+            frame_bgr=frames_to_bgr_bytes(rgb),
+            width=8,
+            height=8,
+            captured_at_utc=datetime.now(tz=timezone.utc),
+            captured_at_monotonic_s=now_monotonic_s,
+            metadata={"source": "test"},
+        )
+        self._latest_frame = frame
+        return CameraStateSample(
+            led_state=LedState.BOOTING,
+            observed_at_monotonic_s=now_monotonic_s,
+            health=CameraHealth.HEALTHY,
+            frame=frame,
+        )
+
+    def await_charging_gate(self, cycle_index: int, timeout_s: float, now_monotonic_s: float):
+        raise NotImplementedError("Sequencer uses classify.await_charging_gate")
+
+    def latest_frame(self) -> CameraFrame | None:
+        return self._latest_frame
+
+
 class _AlwaysMismatchContactors(GpioSimContactorController):
     def detect_mains_command_mismatch(self, allowed_stagger_ms: int, now_monotonic_s: float) -> bool:
         return True
@@ -138,6 +182,8 @@ class SequencerTests(unittest.TestCase):
             roi_y=0,
             roi_width=8,
             roi_height=8,
+            charging_green_window_s=2.0,
+            charging_green_required_frames=3,
         )
         return replace(cfg, timing=timing, vision=vision)
 
@@ -342,6 +388,37 @@ class SequencerTests(unittest.TestCase):
         self.assertFalse(contactors.snapshot().commanded_closed[ContactorName.K1])
         self.assertFalse(contactors.snapshot().commanded_closed[ContactorName.K2])
         self.assertFalse(contactors.snapshot().commanded_closed[ContactorName.K3])
+
+    def test_stuck_booting_timeout_halts(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _TwoHueCamera()
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(trip_time_s=0.015),
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+        self.assertEqual(result.terminal, Terminal.HALTED)
+        self.assertIn("vision_gate_timeout_stuck_booting", result.halt_reason or "")
+
+    def test_green_flashing_grants_charging_quickly(self) -> None:
+        """End-to-end: the real `Sequencer` + `ccid.classify` integration
+        grants charging on a flashing-green camera well before
+        `boot_timeout_s`, using the ChargingGatePolicy grant path rather than
+        the slower window-classifier consensus."""
+
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera(
+            ([LedState.CHARGING, LedState.OFF_OR_UNKNOWN] * 60)
+        )
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(trip_time_s=0.010),
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        self.assertEqual(result.cycles[0].terminal, Terminal.PASS)
 
 
 if __name__ == "__main__":
