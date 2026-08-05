@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 from ccid.classify import LedColor, frames_to_bgr_bytes, make_led_frame
-from ccid.config import AppConfig, TimingConfig, load_config
+from ccid.config import AppConfig, TimingConfig, VisionConfig, load_config
 from ccid.hal.base import CameraFrame, CameraHealth, CameraStateSample, ContactorName
 from ccid.hal.gpio_sim import GpioSimContactorController
 from ccid.hal.scope_sim import ScopeSim, ScopeSimScenario
@@ -121,7 +121,13 @@ class SequencerTests(unittest.TestCase):
             heartbeat_grace_s=cfg.timing.heartbeat_grace_s,
             mains_stagger_ms=cfg.timing.mains_stagger_ms,
         )
-        return replace(cfg, timing=timing)
+        vision = VisionConfig(
+            roi_x=0,
+            roi_y=0,
+            roi_width=8,
+            roi_height=8,
+        )
+        return replace(cfg, timing=timing, vision=vision)
 
     def _initialize(self, target_cycles: int = 1):
         run_id = "20260803_180000"

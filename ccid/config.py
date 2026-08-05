@@ -26,14 +26,16 @@ _TOP_LEVEL_KEYS = frozenset(
     {
         "schema_version",
         "gpio",
+	"vision",
         "timing",
         "modes",
         "paths",
         "monitoring",
-        "analysis",
+        "analysis"
     }
 )
 _GPIO_KEYS = frozenset({"k1", "k2", "k3"})
+_VISION_KEYS = frozenset({"roi_x", "roi_y", "roi_width", "roi_height"})
 _TIMING_KEYS = frozenset(
     {
         "cooldown_s",
@@ -115,9 +117,17 @@ class MonitoringConfig:
 
 
 @dataclass(frozen=True)
+class VisionConfig:
+    roi_x: int
+    roi_y: int
+    roi_width: int
+    roi_height: int
+
+@dataclass(frozen=True)
 class AppConfig:
     schema_version: int
     gpio: GpioConfig
+    vision: VisionConfig
     timing: TimingConfig
     modes: ModesConfig
     paths: PathsConfig
@@ -161,12 +171,14 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
 
     schema_version = _require_int(raw, "schema_version", minimum=1)
     gpio_map = _require_mapping(raw, "gpio")
+    vision_map = _require_mapping(raw, "vision")
     timing_map = _require_mapping(raw, "timing")
     modes_map = _require_mapping(raw, "modes")
     paths_map = _require_mapping(raw, "paths")
     monitoring_map = _require_mapping(raw, "monitoring")
 
     _reject_unknown_keys("gpio", gpio_map, _GPIO_KEYS)
+    _reject_unknown_keys("vision", vision_map, _VISION_KEYS)
     _reject_unknown_keys("timing", timing_map, _TIMING_KEYS)
     _reject_unknown_keys("modes", modes_map, _MODES_KEYS)
     _reject_unknown_keys("paths", paths_map, _PATHS_KEYS)
@@ -179,6 +191,13 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
     )
     if len({gpio.k1, gpio.k2, gpio.k3}) != 3:
         raise ConfigValidationError("GPIO numbers must be unique across K1, K2, and K3")
+
+    vision = VisionConfig(
+        roi_x=_require_int(vision_map, "roi_x", minimum=0),
+        roi_y=_require_int(vision_map, "roi_y", minimum=0),
+        roi_width=_require_int(vision_map, "roi_width", minimum=1),
+        roi_height=_require_int(vision_map, "roi_height", minimum=1),
+    )
 
     timing = TimingConfig(
         cooldown_s=_require_float(timing_map, "cooldown_s", positive=True),
@@ -237,6 +256,7 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
     return AppConfig(
         schema_version=schema_version,
         gpio=gpio,
+	vision=vision,
         timing=timing,
         modes=modes,
         paths=paths,
@@ -322,6 +342,7 @@ def _canonical_for_hash(config: AppConfig) -> dict[str, Any]:
     return {
         "schema_version": raw["schema_version"],
         "gpio": raw["gpio"],
+        "vision": raw["vision"],
         "timing": raw["timing"],
         "modes": raw["modes"],
         # The endpoint definition is part of the frozen campaign contract.

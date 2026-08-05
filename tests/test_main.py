@@ -74,6 +74,11 @@ class MainTests(unittest.TestCase):
                   k1: 17
                   k2: 27
                   k3: 22
+                vision:
+                  roi_x: 0
+                  roi_y: 0
+                  roi_width: 16
+                  roi_height: 16
                 timing:
                   cooldown_s: 0.01
                   cooldown_retry_s: 0.02

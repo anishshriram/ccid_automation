@@ -24,6 +24,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.gpio.k1, 17)
         self.assertEqual(config.timing.scope_arm_timeout_s, 2.0)
         self.assertEqual(config.modes.gpio_mode, "sim")
+        self.assertEqual(config.vision.roi_x, 35)
+        self.assertEqual(config.vision.roi_y, 120)
+        self.assertEqual(config.vision.roi_width, 450)
+        self.assertEqual(config.vision.roi_height, 350)
 
     def test_rejects_duplicate_gpio(self) -> None:
         path = self._write_config(
@@ -102,6 +106,7 @@ class ConfigTests(unittest.TestCase):
             """
             schema_version: 1
             gpio: {k1: 17, k2: 27, k3: 22}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350}
             timing:
               cooldown_s: 10
               cooldown_retry_s: 60
@@ -129,6 +134,7 @@ class ConfigTests(unittest.TestCase):
               gpio_mode: sim
               camera_mode: sim
               scope_mode: sim
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350}
             timing:
               mains_stagger_ms: 0
               heartbeat_grace_s: 300

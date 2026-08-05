@@ -18,6 +18,7 @@ from ccid.analysis import (
 from ccid.classify import (
     DEGRADED_FLAG_CAMERA_UNAVAILABLE,
     GateTimeoutAction,
+    RegionOfInterest,
     await_charging_gate,
     gate_timeout_action,
 )
@@ -114,6 +115,12 @@ class Sequencer:
         self._contactors = contactors
         self._scope = scope
         self._camera = camera
+        self._vision_roi = RegionOfInterest(
+            x=config.vision.roi_x,
+            y=config.vision.roi_y,
+            width=config.vision.roi_width,
+            height=config.vision.roi_height,
+        )
         self._recorder = recorder
         self._scope_settings = scope_settings or ScopeSettings()
         self._now = monotonic_now
@@ -323,6 +330,7 @@ class Sequencer:
         )
         gate = await_charging_gate(
             self._camera,
+            roi=self._vision_roi,
             timeout_s=self._config.timing.boot_timeout_s,
             degraded_flag_out=context.degraded_flags,
             monotonic=self._now,
