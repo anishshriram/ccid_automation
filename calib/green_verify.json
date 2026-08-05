@@ -1,0 +1,9 @@
+{
+  "green": {
+    "expected": "green",
+    "final_window_confidence": 0.3226433528408792,
+    "frames_observed": 161,
+    "matched": true,
+    "stable_color": "green"
+  }
+}

@@ -3,3 +3,8 @@ __pycache__/
 *.pyo
 venv/
 runs/
+calib/booting/
+calib/booting_recommission/
+calib/green_exposure30/
+calib/green_exposure30_recording/
+calib/green_filtered/
