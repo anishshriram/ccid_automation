@@ -190,11 +190,25 @@ class CameraSim(CameraInterface):
         return fixtures
 
     @staticmethod
-    def _default_fixtures() -> list[CameraSimFrameFixture]:
-        return [
-            CameraSimFrameFixture(led_state=LedState.BOOTING, frame_bgr=b"\x00\x00\x00"),
-            CameraSimFrameFixture(led_state=LedState.BOOTING, frame_bgr=b"\x10\x10\x10"),
-            CameraSimFrameFixture(led_state=LedState.READY, frame_bgr=b"\x20\x00\x20"),
-            CameraSimFrameFixture(led_state=LedState.CHARGING, frame_bgr=b"\x00\x20\x00"),
-        ]
+    def _default_fixtures():
+        width = 16
+        height = 16
 
+        def fixture(
+            state: LedState,
+            bgr_pixel: tuple[int, int, int],
+        ) -> CameraSimFrameFixture:
+            frame_bgr = bytes(bgr_pixel) * (width * height)
+            return CameraSimFrameFixture(
+                led_state=state,
+                frame_bgr=frame_bgr,
+                width=width,
+                height=height,
+            )
+
+        return [
+            fixture(LedState.BOOTING, (235, 60, 20)),
+            fixture(LedState.BOOTING, (30, 25, 230)),
+            fixture(LedState.READY, (235, 60, 20)),
+            fixture(LedState.CHARGING, (60, 210, 30)),
+        ]

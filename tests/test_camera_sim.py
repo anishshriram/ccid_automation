@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from ccid.classify import await_charging_gate
 from ccid.hal.base import CameraHealth
 from ccid.hal.camera_sim import CameraSim, CameraSimError
 from ccid.states import LedState
@@ -35,6 +36,24 @@ class CameraSimTests(unittest.TestCase):
         self.assertEqual(sample.led_state, LedState.CHARGING)
         self.assertIsNotNone(sample.frame)
         self.assertEqual(sample.frame.metadata.get("source"), "fixture")
+     
+    def test_default_fixtures_reach_charging_through_optical_gate(self) -> None:
+        camera = CameraSim(monotonic_now=self.clock.now)
+        camera.start()
+
+        def sleep(duration_s: float) -> None:
+            self.clock.now_s += duration_s
+
+        result = await_charging_gate(
+            camera,
+            timeout_s=5.0,
+            monotonic=self.clock.now,
+            sleep=sleep,
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.led_state, LedState.CHARGING)
+        self.assertFalse(result.degraded)
 
     def test_camera_failure_path(self) -> None:
         camera = CameraSim(monotonic_now=self.clock.now, fail_after_samples=1)
