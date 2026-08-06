@@ -62,6 +62,10 @@ class _FakeRM:
 class ScopeRealTests(unittest.TestCase):
     def test_scope_real_configure_arm_capture_path(self) -> None:
         rm = _FakeRM()
+        rm.inst.run_bit_sequence = [
+            8, 8, 0,  # Previous acquisition stops after :STOP.
+            8, 8, 0,  # Fresh :SINGle arms, then acquisition completes.
+        ]
         now_s = [0.0]
 
         def monotonic() -> float:
@@ -88,6 +92,31 @@ class ScopeRealTests(unittest.TestCase):
         self.assertEqual(capture.preamble["points"], 1000)
         self.assertGreater(len(capture.samples), 0)
         self.assertTrue(capture.scope_png.startswith(b"\x89PNG"))
+
+    def test_configure_waits_until_scope_is_stopped(self) -> None:
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [
+            8, 8, 0,  # Previous acquisition stops after :STOP.
+            8, 8, 0,  # Fresh :SINGle arms, then acquisition completes.
+        ]
+        rm.inst.run_bit_sequence = [8, 8, 0]
+        now_s = [0.0]
+
+        def monotonic() -> float:
+            now_s[0] += 0.02
+            return now_s[0]
+
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=monotonic,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.configure_for_cycle(ScopeSettings())
+
+        self.assertEqual(rm.inst.run_bit_sequence, [])
+        self.assertEqual(scope.status(), ScopeStatus.CONFIGURED)
 
     def test_parse_preamble(self) -> None:
         parsed = _parse_keysight_preamble("0,0,1000,1,1e-7,-0.02,0,1,-128,0")

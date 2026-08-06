@@ -74,8 +74,13 @@ class ScopeReal(ScopeInterface):
     def configure_for_cycle(self, settings: ScopeSettings) -> None:
         self._require_connected()
         self._settings = settings
+        self._write(":STOP")
+        if not self._wait_until_stopped(timeout_s=1.0):
+            raise ScopeRealError(
+                "Scope did not reach stopped state before cycle configuration"
+            )
+
         commands = [
-            ":STOP",
             f":TIMebase:SCALe {settings.timebase_scale_s_per_div}",
             f":TIMebase:REFerence {settings.timebase_reference}",
             f":CHANnel1:SCALe {settings.channel1_scale_v_per_div}",
@@ -154,6 +159,20 @@ class ScopeReal(ScopeInterface):
 
     def status(self) -> ScopeStatus:
         return self._status
+
+    def _wait_until_stopped(self, timeout_s: float) -> bool:
+        """Wait until the operation-register run bit is definitely clear."""
+
+        if timeout_s <= 0.0:
+            raise ValueError("timeout_s must be > 0")
+
+        deadline = self._now() + timeout_s
+        while self._now() <= deadline:
+            if not self._run_bit_set():
+                return True
+            time.sleep(0.01)
+
+        return False
 
     def _run_bit_set(self) -> bool:
         condition = int(float(self._query(":OPERegister:CONDition?")))
