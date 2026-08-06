@@ -28,8 +28,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.vision.roi_y, 120)
         self.assertEqual(config.vision.roi_width, 450)
         self.assertEqual(config.vision.roi_height, 350)
-        self.assertEqual(config.vision.charging_green_window_s, 2.0)
+        self.assertEqual(config.vision.charging_green_window_s, 6.0)
         self.assertEqual(config.vision.charging_green_required_frames, 3)
+        self.assertEqual(config.vision.charging_green_min_span_s, 3.5)
         self.assertEqual(config.camera.device_index, 0)
         self.assertEqual(config.paths.min_free_disk_gb, 2)
 
@@ -110,7 +111,7 @@ class ConfigTests(unittest.TestCase):
             """
             schema_version: 1
             gpio: {k1: 17, k2: 27, k3: 22}
-            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 2.0, charging_green_required_frames: 3}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 6.0, charging_green_required_frames: 3, charging_green_min_span_s: 3.5}
             camera: {device_index: 0}
             timing:
               cooldown_s: 10
@@ -141,7 +142,7 @@ class ConfigTests(unittest.TestCase):
               camera_mode: sim
               scope_mode: sim
             camera: {device_index: 0}
-            vision: {charging_green_required_frames: 3, charging_green_window_s: 2.0, roi_height: 350, roi_width: 450, roi_y: 120, roi_x: 35}
+            vision: {charging_green_required_frames: 3, charging_green_min_span_s: 3.5, charging_green_window_s: 6.0, roi_height: 350, roi_width: 450, roi_y: 120, roi_x: 35}
             timing:
               mains_stagger_ms: 0
               heartbeat_grace_s: 300
@@ -169,7 +170,7 @@ class ConfigTests(unittest.TestCase):
             """
             schema_version: 1
             gpio: {k1: 17, k2: 27, k3: 22}
-            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 2.0, charging_green_required_frames: 3, extra_key: 1}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 6.0, charging_green_required_frames: 3, charging_green_min_span_s: 3.5, extra_key: 1}
             camera: {device_index: 0}
             timing:
               cooldown_s: 10
@@ -195,7 +196,7 @@ class ConfigTests(unittest.TestCase):
             """
             schema_version: 1
             gpio: {k1: 17, k2: 27, k3: 22}
-            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 0, charging_green_required_frames: 3}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 0, charging_green_required_frames: 3, charging_green_min_span_s: 3.5}
             camera: {device_index: 0}
             timing:
               cooldown_s: 10
@@ -221,7 +222,7 @@ class ConfigTests(unittest.TestCase):
             """
             schema_version: 1
             gpio: {k1: 17, k2: 27, k3: 22}
-            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 2.0, charging_green_required_frames: 0}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 6.0, charging_green_required_frames: 0, charging_green_min_span_s: 3.5}
             camera: {device_index: 0}
             timing:
               cooldown_s: 10
@@ -247,7 +248,7 @@ class ConfigTests(unittest.TestCase):
             """
             schema_version: 1
             gpio: {k1: 17, k2: 27, k3: 22}
-            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 2.0, charging_green_required_frames: 3}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 6.0, charging_green_required_frames: 3, charging_green_min_span_s: 3.5}
             camera: {device_index: 0, extra_key: 1}
             timing:
               cooldown_s: 10
@@ -273,7 +274,7 @@ class ConfigTests(unittest.TestCase):
             """
             schema_version: 1
             gpio: {k1: 17, k2: 27, k3: 22}
-            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 2.0, charging_green_required_frames: 3}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 6.0, charging_green_required_frames: 3, charging_green_min_span_s: 3.5}
             camera: {device_index: 0}
             timing:
               cooldown_s: 10

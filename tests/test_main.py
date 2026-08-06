@@ -79,8 +79,9 @@ class MainTests(unittest.TestCase):
                   roi_y: 0
                   roi_width: 16
                   roi_height: 16
-                  charging_green_window_s: 2.0
+                  charging_green_window_s: 6.0
                   charging_green_required_frames: 3
+                  charging_green_min_span_s: 3.5
                 camera:
                   device_index: 0
                 timing:

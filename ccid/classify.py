@@ -161,8 +161,9 @@ class LedOpticalConfig:
     # Charging-gate grant policy (ChargingGatePolicy): recent-green-evidence
     # window, deliberately independent of the window-classifier's
     # consecutive-agreement machinery above (see await_charging_gate).
-    charging_green_window_s: float = 2.0
+    charging_green_window_s: float = 6.0
     charging_green_required_frames: int = 3
+    charging_green_min_span_s: float = 3.5
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.min_saturation <= 1.0:
@@ -195,6 +196,12 @@ class LedOpticalConfig:
             raise ValueError("charging_green_window_s must be > 0")
         if self.charging_green_required_frames < 1:
             raise ValueError("charging_green_required_frames must be >= 1")
+        if self.charging_green_min_span_s <= 0.0:
+            raise ValueError("charging_green_min_span_s must be > 0")
+        if self.charging_green_min_span_s > self.charging_green_window_s:
+            raise ValueError(
+                "charging_green_min_span_s must be <= charging_green_window_s"
+            )
 
     @property
     def window_frames(self) -> int:
@@ -585,17 +592,15 @@ class LedClassifier:
 
 
 class ChargingGatePolicy:
-    """Recent-green-evidence charging-gate grant policy.
+    """Grant only on sustained, repeated green evidence.
 
-    Deliberately independent of `LedClassifier`'s window/consecutive-agreement
-    machinery, which still governs the FAULTED/READY/OFF_OR_UNKNOWN/BOOTING
-    diagnostic state reported at gate timeout. That window can be tipped into
-    BOOTING by an isolated, low-pixel-fraction stray hue (camera noise/glare)
-    landing in just `window_hue_min_frames` frames anywhere across a ~3 s/45
-    frame history, which incorrectly denies a genuinely charging (flashing
-    green) LED. This policy instead grants on recent green-frame density
-    alone, blocked only by red, so an isolated non-green frame cannot deny a
-    real green flash.
+    The charging indication may flash, so dark or unknown frames do not erase
+    valid green observations. Red or blue indicates a non-charging sequence
+    and clears all accumulated green evidence.
+
+    A brief green segment during the EVSE boot animation must not grant the
+    gate. Green evidence must include the required number of frames and span
+    the configured minimum qualification time.
     """
 
     def __init__(self, config: LedOpticalConfig) -> None:
@@ -606,26 +611,44 @@ class ChargingGatePolicy:
         self._green_timestamps.clear()
 
     def record(self, now_s: float, detail: FrameClassification) -> bool:
-        """Feed one frame's classification. Returns True once the gate should grant."""
+        """Feed one frame and return True only for sustained charging green."""
 
         window_start = now_s - self.config.charging_green_window_s
-        while self._green_timestamps and self._green_timestamps[0] < window_start:
+        while (
+            self._green_timestamps
+            and self._green_timestamps[0] < window_start
+        ):
             self._green_timestamps.popleft()
 
-        # Broad check (hues_present, not just the collapsed .color): red must
-        # block/clear evidence even from a frame the per-frame classifier
-        # already called BOOTING because red coexisted with another hue.
-        if LedColor.RED in detail.hues_present:
+        # Red or blue anywhere in the frame indicates booting, ready, or
+        # fault behavior. Qualification restarts after that observation.
+        if (
+            LedColor.RED in detail.hues_present
+            or LedColor.BLUE in detail.hues_present
+        ):
             self._green_timestamps.clear()
             return False
 
-        # Narrow check: only a frame where green is the frame's dominant/sole
-        # classification counts as evidence, not merely "green present".
-        if detail.color == LedColor.GREEN:
-            self._green_timestamps.append(now_s)
+        # Dark and unknown frames may occur between charging-green flashes.
+        # They do not add evidence, and the gate cannot grant on them.
+        if detail.color != LedColor.GREEN:
+            return False
 
-        return len(self._green_timestamps) >= self.config.charging_green_required_frames
+        self._green_timestamps.append(now_s)
 
+        if (
+            len(self._green_timestamps)
+            < self.config.charging_green_required_frames
+        ):
+            return False
+
+        qualification_span_s = (
+            self._green_timestamps[-1] - self._green_timestamps[0]
+        )
+        return (
+            qualification_span_s
+            >= self.config.charging_green_min_span_s
+        )
 
 def gate_timeout_action(led_state: LedState) -> tuple[GateTimeoutAction, str]:
     """Map the LED state observed at gate timeout onto the required response."""

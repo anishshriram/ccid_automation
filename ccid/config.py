@@ -57,6 +57,7 @@ _VISION_KEYS = frozenset(
         "roi_height",
         "charging_green_window_s",
         "charging_green_required_frames",
+        "charging_green_min_span_s",
     }
 )
 _TIMING_KEYS = frozenset(
@@ -149,6 +150,7 @@ class VisionConfig:
     roi_height: int
     charging_green_window_s: float
     charging_green_required_frames: int
+    charging_green_min_span_s: float
 
 
 @dataclass(frozen=True)
@@ -236,6 +238,9 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
         charging_green_window_s=_require_float(vision_map, "charging_green_window_s", positive=True),
         charging_green_required_frames=_require_int(
             vision_map, "charging_green_required_frames", minimum=1
+        ),
+        charging_green_min_span_s=_require_float(
+            vision_map, "charging_green_min_span_s", positive=True
         ),
     )
 

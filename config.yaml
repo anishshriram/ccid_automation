@@ -14,8 +14,9 @@ vision:
   # this many confidently-green frames are seen within this rolling window.
   # Starting values, not locked - validate against real C270 frame rate and
   # actual EVSE flash cadence.
-  charging_green_window_s: 2.0
+  charging_green_window_s: 6.0
   charging_green_required_frames: 3
+  charging_green_min_span_s: 3.5
 
 camera:
   # Which /dev/videoN the Logitech C270 enumerates as on this Pi. Deployment-

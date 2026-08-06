@@ -147,6 +147,7 @@ class Sequencer:
             DEFAULT_OPTICAL_CONFIG,
             charging_green_window_s=config.vision.charging_green_window_s,
             charging_green_required_frames=config.vision.charging_green_required_frames,
+            charging_green_min_span_s=config.vision.charging_green_min_span_s,
         )
         self._recorder = recorder
         self._scope_settings = scope_settings or ScopeSettings()

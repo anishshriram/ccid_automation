@@ -182,8 +182,9 @@ class SequencerTests(unittest.TestCase):
             roi_y=0,
             roi_width=8,
             roi_height=8,
-            charging_green_window_s=2.0,
+            charging_green_window_s=6.0,
             charging_green_required_frames=3,
+            charging_green_min_span_s=3.5,
         )
         return replace(cfg, timing=timing, vision=vision)
 
@@ -250,7 +251,7 @@ class SequencerTests(unittest.TestCase):
     def test_red_timeout_retries_once_then_succeeds(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)
         # First timeout window sees red, second window sees green.
-        camera = _ScriptedCamera(([LedState.FAULTED] * 70) + ([LedState.CHARGING] * 180))
+        camera = _ScriptedCamera(([LedState.FAULTED] * 60) + ([LedState.CHARGING] * 180))
         sequencer = self._make_sequencer(
             camera=camera,
             scope_scenario=self._scope_scenario(trip_time_s=0.015),
