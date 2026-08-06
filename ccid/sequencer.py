@@ -406,6 +406,21 @@ class Sequencer:
                 reason="scope_not_armed_timeout",
             )
 
+        # Allow the fresh Single acquisition to settle, then confirm that an
+        # unrelated transient has not consumed it before K3 can close.
+        self._sleep(0.05)
+
+        if not self._poll_scope_armed():
+            self._open_mains_with_cooldown(
+                context,
+                include_cooldown=False,
+            )
+            raise _SequencerHalt(
+                terminal=Terminal.RIG_FAULT,
+                category=FaultCategory.RIG,
+                reason="scope_lost_armed_before_injection",
+            )
+
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.INJECTING)
         gate_token = ChargingGateToken(cycle_index=cycle_index, granted_at_monotonic_s=self._now())
         self._contactors.close_k3(gate_token)

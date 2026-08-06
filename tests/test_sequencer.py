@@ -105,6 +105,36 @@ class _BlockingNeverTriggeredScope(ScopeSim):
         self._clock.sleep(timeout_s)
         return False
 
+class _ArmedThenConsumedScope(ScopeSim):
+    """Scope whose Single acquisition is consumed before K3 injection."""
+
+    def __init__(
+        self,
+        *,
+        clock: _ManualClock,
+        scenario: ScopeSimScenario,
+    ) -> None:
+        super().__init__(
+            scenario=scenario,
+            monotonic_now=clock.now,
+        )
+        self.armed_checks = 0
+
+    def wait_until_armed(
+        self,
+        timeout_s: float,
+        now_monotonic_s: float,
+    ) -> bool:
+        self.armed_checks += 1
+
+        if self.armed_checks == 1:
+            return super().wait_until_armed(
+                timeout_s=timeout_s,
+                now_monotonic_s=now_monotonic_s,
+            )
+
+        return False
+
 class _TwoHueCamera:
     """Always returns a genuinely two-hue (blue+red) frame, exercising the
     real per-frame >=2-hues BOOTING classification directly rather than
@@ -321,6 +351,50 @@ class SequencerTests(unittest.TestCase):
         result = sequencer.run(run_dir=run_dir, state=state)
         self.assertEqual(result.terminal, Terminal.RIG_FAULT)
         self.assertEqual(result.fault_category, FaultCategory.RIG)
+
+    def test_scope_consumed_before_injection_never_closes_k3(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera(
+            [LedState.CHARGING] * 200
+        )
+        contactors = GpioSimContactorController(
+            monotonic_now=self.clock.now
+        )
+        scenario = self._scope_scenario(
+            trip_time_s=0.010
+        )
+        scope = _ArmedThenConsumedScope(
+            clock=self.clock,
+            scenario=scenario,
+        )
+
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+
+        result = sequencer.run(
+            run_dir=run_dir,
+            state=state,
+        )
+
+        operations = [
+            event.operation
+            for event in contactors.events()
+        ]
+
+        self.assertEqual(
+            result.terminal,
+            Terminal.RIG_FAULT,
+        )
+        self.assertIn(
+            "scope_lost_armed_before_injection",
+            result.halt_reason or "",
+        )
+        self.assertNotIn("close_k3", operations)
+        self.assertGreaterEqual(scope.armed_checks, 2)
 
     def test_k3_backstop_opens_before_blocking_acquisition_timeout(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)
