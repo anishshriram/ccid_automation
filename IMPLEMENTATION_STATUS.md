@@ -2,6 +2,10 @@
 
 ## Current phase
 - Phase 11: commissioning and replay tools (implemented). All 11 phases are now complete.
+- Post-Phase-11: camera charging-gate redesign (`51d8b24`) and a fault-matrix/disk-space/
+  camera-config/doc hardening pass (`449a4ba`) have also landed. See the dedicated sections near the
+  end of this file. Hardware validation of the gate redesign is not yet confirmed done — see
+  `CODING_AGENT_HANDOFF.md`'s "Camera/vision commissioning status".
 
 ## Phase 1-10 Implementation Summary
 - Phase 1: Domain model, errors, clock, config with locked defaults
@@ -43,7 +47,8 @@
 - Reject unknown keys (strict schema)
 
 ## Tests passing/failing
-- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (229 tests)
+- Passing: `python -m unittest discover -s tests -p 'test_*.py'` (269 tests, 2 intentionally skipped
+  as of the post-Phase-11 hardening pass; 229 as of Phase 11 completion, see below)
 - Passing: `python -m unittest discover -s tests -p 'test_analysis.py'` (67 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_classify.py'` (45 tests)
 - Passing: `python -m unittest discover -s tests -p 'test_sequencer.py'` (10 tests)
@@ -388,11 +393,95 @@
   loading via OpenCV in `calibrate_camera.py`) are implemented but **NOT RUN -
   HARDWARE REQUIRED**, consistent with every other real-HAL path in this repo.
 
+## Post-Phase-11: camera charging-gate redesign (`51d8b24`)
+
+Root cause of a live-hardware `vision_gate_timeout_stuck_booting` halt despite the operator visually
+observing the EVSE LED flashing green: `LedClassifier.window_classification()` in
+[ccid/classify.py](ccid/classify.py) can be tipped from a correct GREEN reading into a window-level
+BOOTING verdict by as few as 2 frames (out of ~45) carrying a spurious secondary hue — plausible from
+real-camera noise/glare, not reproducible with clean synthetic green/dark alternation alone (confirmed
+by injecting a synthetic spurious-hue frame and reproducing the flip against the actual code before
+changing anything).
+
+Fix, keeping the existing window/consecutive-agreement classifier fully intact (it still drives
+FAULTED/READY/OFF/BOOTING *timeout-diagnostic* reporting):
+- New `ChargingGatePolicy` class ([ccid/classify.py](ccid/classify.py)): grants on recent-green-frame
+  density within a rolling window, blocked/cleared only by red (checked via `hues_present`, so red
+  still blocks even inside a per-frame multi-hue/BOOTING frame). No cooldown after a red sighting —
+  green can start re-accumulating on the very next frame, verified against the real
+  `make_booting_sequence` boot-animation shape so a genuine boot sequence still never grants
+  prematurely.
+- `LedOpticalConfig` gains `charging_green_window_s` (default `2.0`) and
+  `charging_green_required_frames` (default `3`).
+- `ccid/config.py`/`config.yaml`'s existing `vision:` section gains matching required keys (same
+  names) — extends the ROI-only section added earlier rather than introducing a new one.
+- `ccid/sequencer.py`'s `Sequencer.__init__` now actually builds a `LedOpticalConfig` from
+  `config.vision` and passes it into `await_charging_gate()` — previously production always used
+  hardcoded `DEFAULT_OPTICAL_CONFIG` regardless of `config.yaml`, a pre-existing dead-config gap
+  fixed as part of this change.
+- Regression test added (`tests/test_classify.py::test_transient_spurious_hue_frames_do_not_block_a_genuine_green_flash`)
+  proving the exact failure shape now grants correctly. New sequencer-level
+  `test_stuck_booting_timeout_halts` closes a gap — no test previously covered stuck-BOOTING halt at
+  the full `Sequencer` level, only at the classifier/gate level.
+
+**Not yet done:** real flashing-green footage capture/replay and one supervised live cycle against
+this fix. See `CODING_AGENT_HANDOFF.md`'s "Camera/vision commissioning status" for the full picture,
+including run IDs already used (do not reuse) and what a hardware-commissioning handoff document
+(2026-08-05, not itself a repo file) specified as the acceptance criteria before returning to live
+leakage-injection testing.
+
+## Post-Phase-11: fault-matrix, disk-space, camera-config, and doc hardening (`449a4ba`)
+
+Audited `coding_instructions.txt` against actual repo state (not assumptions) to find what's missing
+that's genuinely unit-testable without hardware, then implemented all of it:
+
+- **`tests/test_faultmatrix.py`** (new) — required by the repo structure spec (`coding_instructions.txt`
+  section 5) but did not exist. One test method per fault-matrix row from section 7, each asserting
+  the *full* required property set (terminal/fault classification, retry-degrade-continue-halt
+  decision, final commanded contactor states + opening order, runstate contents, whether artifacts
+  were committed) rather than duplicating the lighter terminal/halt_reason coverage `test_sequencer.py`
+  already had. Adds real coverage for two previously-untested rows: `ScopeReal`'s bounded
+  reconnect-on-comms-drop, and `HttpNotifier` swallowing a raising transport without halting. Two rows
+  the spec itself says cannot be locally proven (K1/K2 physically stuck closed; missing external
+  heartbeat) are explicit `skipTest` stubs citing why, so the matrix is visibly complete rather than
+  silently absent.
+- **Disk-space check** — new `paths.min_free_disk_gb` config key (default `2`, matching the spec's
+  literal "2 GB" fault-matrix row) and an injectable `disk_usage` callable on `Sequencer` (mirrors the
+  existing `monotonic_now`/`sleep` injection pattern). Checked as the very first action of each cycle
+  attempt, before mains are ever commanded closed — halts as a `PERSISTENCE`-category fault rather
+  than risking a partial artifact write after already spending a DUT cycle.
+- **Camera `device_index` config** — new `camera:` top-level config section (`device_index`, required).
+  `ccid/main.py`'s `build_hal_bundle` now passes a `CameraRealConfig(device_index=...)` into the real
+  camera branch; previously always hardcoded to `0` with no `config.yaml` path at all. Deliberately
+  the *only* new camera knob — width/height/fps stay hardcoded (matches the C270's documented nominal
+  640x480/30fps stream); VISA backend and scope reconnect-attempt count were considered and
+  deliberately left hardcoded too, since the spec locks both of those, unlike camera device index
+  which is genuinely per-deployment.
+- **Per-cycle software version + config hash** — new `ccid.__version__` (`ccid/__init__.py`, currently
+  `"1.0.0"`), and `RunRecorder.record_cycle`'s sidecar-merge block now includes `config_hash` (from
+  the `RunState` already in scope) and `software_version` alongside the existing `analysis_version`.
+  `cycles.csv`'s locked column schema is untouched — this is sidecar-JSON-only.
+- **`IMPLEMENTATION_QUESTIONS.md`** (new) — records the two genuinely open, not-software-resolvable
+  items: K1/K2 physical-state readback, and UL 2231-2 endpoint confirmation.
+- **Fixed a pre-existing, unrelated test failure**: `test_config.py::test_loads_example_config` had
+  hardcoded `gpio_mode == "sim"`, but `config.yaml` had been `real` since hardware commissioning
+  (confirmed via `git stash` that this predated the session's changes). Now asserts against either
+  valid mode.
+- **Readability pass**, scoped to the four files an audit found notably thin relative to the
+  codebase's own established bar (`ccid/analysis.py`/`ccid/classify.py`): module docstrings and
+  WHY-comments added to `ccid/recorder.py` (crash-safe commit ordering, atomic-write idiom),
+  `ccid/sequencer.py` (control-flow-via-exception pattern, K3 backstop guard), `ccid/main.py`
+  (systemd watchdog interval halving, exit-code contract), `ccid/config.py` (config-hash-freeze
+  contract, plus a real tab/space indentation defect fixed); one clarifying comment added to
+  `ccid/hal/camera_real.py`. Deliberately not touched: `tools/`, `errors.py`, `clock.py`, `safety.py`,
+  `hal/base.py`, `hal/gpio_sim.py` — already adequate, no churn added.
+
 ## Definition-of-done status
 All required modules, HAL contracts, safety invariants, fault-matrix tests,
 persistence/resume guarantees, and Phase 1-11 deliverables listed in
 `coding_instructions.txt` section 13 are implemented and unit-tested off
-target. Electrical commissioning (Stages 1-6), the full simulated 6,000-cycle
-campaign, and every hardware-dependent check remain **NOT RUN - HARDWARE
-REQUIRED**; this repository is a complete software implementation, not a
-substitute for physical commissioning.
+target, including the two post-Phase-11 rounds above. Electrical commissioning
+(Stages 1-6), the full simulated 6,000-cycle campaign, hardware-side watchdog
+verification, and real-footage validation of the camera charging-gate fix all
+remain **NOT RUN - HARDWARE REQUIRED**; this repository is a complete software
+implementation, not a substitute for physical commissioning.
