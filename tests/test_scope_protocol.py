@@ -187,6 +187,8 @@ class HalProtocolTests(unittest.TestCase):
 
         self.assertEqual(settings.timebase_scale_s_per_div, 0.05)
         self.assertEqual(settings.timebase_reference, "CENTER")
+        self.assertEqual(settings.channel1_coupling, "AC")
+        self.assertEqual(settings.channel1_coupling, "AC")
 
 
 if __name__ == "__main__":

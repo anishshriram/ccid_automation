@@ -49,7 +49,7 @@ class ScopeSettings:
     timebase_reference: str = "CENTER"
     channel1_scale_v_per_div: float = 50.0
     channel1_offset_v: float = 0.0
-    channel1_coupling: str = "DC"
+    channel1_coupling: str = "AC"
     channel1_probe_ratio: int = 10
     trigger_sweep: str = "NORMal"
     trigger_source: str = "CHANnel1"
