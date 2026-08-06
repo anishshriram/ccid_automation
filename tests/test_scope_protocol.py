@@ -182,6 +182,12 @@ class HalProtocolTests(unittest.TestCase):
         self.assertIn("x_increment", capture.preamble)
         self.assertEqual(scope.status(), ScopeStatus.COMPLETE)
 
+    def test_default_scope_settings_preserve_pre_and_post_trigger_history(self) -> None:
+        settings = ScopeSettings()
+
+        self.assertEqual(settings.timebase_scale_s_per_div, 0.05)
+        self.assertEqual(settings.timebase_reference, "CENTER")
+
 
 if __name__ == "__main__":
     unittest.main()
