@@ -354,12 +354,17 @@ class FaultMatrixTests(unittest.TestCase):
         self.assertTrue((run_dir / "diagnostics" / "1" / "scope_timeout.png").exists())
         self.assertTrue((run_dir / "diagnostics" / "1" / "scope_state.json").exists())
 
-    def test_scope_stale_trigger_event_before_arm_row(self) -> None:
+    def test_scope_stuck_trigger_event_before_arm_row(self) -> None:
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 12: only a *persistent*
+        # trigger-event register (still nonzero on the verification read
+        # after the baseline-clearing read) is a fault-matrix row - a
+        # self-clearing stale event is not (see
+        # test_scope_stale_trigger_event_before_arm_is_cleared_row below).
         run_dir, state = self._initialize(target_cycles=1)
         camera = _ScriptedCamera([LedState.CHARGING] * 120)
         sequencer, contactors = self._make_sequencer(
             camera=camera,
-            scope_scenario=self._scope_scenario(trigger_event_latched_at_configure=True),
+            scope_scenario=self._scope_scenario(trigger_event_stuck_at_configure=True),
         )
 
         result = sequencer.run(run_dir=run_dir, state=state)
@@ -370,6 +375,26 @@ class FaultMatrixTests(unittest.TestCase):
         self._assert_safe_and_ordered(contactors)
         self._assert_runstate(run_dir, halt_reason_present=True)
         self.assertFalse(self._artifact_committed(run_dir))
+
+    def test_scope_stale_trigger_event_before_arm_is_cleared_row(self) -> None:
+        # A self-clearing stale TER event must not halt the cycle - proves
+        # the fix for the real forced-diagnostic run that halted here on
+        # ordinary residue from a single-read check.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        sequencer, contactors = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(
+                trigger_event_latched_at_configure=True, trip_time_s=0.010
+            ),
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        self.assertEqual(result.cycles[0].terminal, Terminal.PASS)
+        self._assert_safe_and_ordered(contactors)
+        self.assertTrue(self._artifact_committed(run_dir))
 
     def test_scope_trigger_event_before_injection_row(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)

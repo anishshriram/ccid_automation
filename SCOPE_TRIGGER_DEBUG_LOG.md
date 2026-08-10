@@ -25,21 +25,33 @@ now all been checked and correctly configured multiple times without
 resolving the halt - **do not modify normal trigger settings again** without
 new evidence specifically implicating one.
 
-Entry 11 adds a diagnostic-only forced capture: if TER is still 0
+Entry 11 added a diagnostic-only forced capture: if TER is still 0
 ~100 ms after K3 closes, `:TRIGger:FORCe` (confirmed via the official
 Keysight InfiniiVision 2000 X-Series Programmer's Guide - this exact model
 family, write-only, no query form, equivalent to the front-panel [Force
 Trigger] key) forces the pending single-shot acquisition to complete so the
 resulting waveform shows what the analog front end actually looked like
-partway through the closed window. The command itself fires live, but the
-data transfer is deferred until after full safe-off so it can never delay
-the unchanged 300 ms K3 backstop. Data is written only under
+partway through the closed window. Data is written only under
 `diagnostics/<cycle>/`, explicitly labeled
 `"capture_type": "forced_diagnostic_non_measurement"`, and never reaches
-`analyze_waveform`, PASS/FAIL, or trip-time calculation. **Untested against
-real hardware** - the next energized cycle is the first real test of
-whether the forced capture actually shows something diagnostically useful
-about why the real trigger never fires.
+`analyze_waveform`, PASS/FAIL, or trip-time calculation.
+
+**Entry 11's real dry run found a bug in Entry 10's baseline check, not in
+the forced-diagnostic feature itself:** the cycle halted with
+`scope_stale_trigger_event_before_arm` before ever reaching arm. Since
+`:TER?` is read-and-clear (confirmed in the manual, Entry 11), a *single*
+nonzero baseline read can never distinguish genuinely stale residue left
+over from a prior cycle/session (harmless once cleared) from an actively
+faulty condition - the single-read check could not tell them apart and
+halted on what was very likely ordinary residue. Entry 12 fixes this: the
+baseline check now reads twice (clear, then verify) and only halts if the
+*verification* read is still nonzero. The pre-injection TER check
+(immediately before K3 close) is intentionally unchanged - a single read
+there is still correct, since it should already be starting from the clean
+baseline this fix now actually establishes. **Untested against real
+hardware** - the next energized cycle is the first real test of both this
+fix and whether the forced capture (unaffected by this fix) shows anything
+useful once the cycle actually reaches arm/K3 close.
 
 Also still unconfirmed independently on this unit (though now strongly
 supported by the official manual, which explicitly states `:TER?` is
@@ -47,7 +59,10 @@ read-and-clear): whether that documented behavior is what this specific
 MSO-X 2014A actually does - the project's own experience with
 `:TRIGger:NREJect` (documented, but confirmed unsupported on this unit in
 Entry 9) is a standing reason not to fully equate "documented" with
-"confirmed on this hardware."
+"confirmed on this hardware." Per operator instruction, normal trigger
+settings (mode, coupling, edge source/slope/level, probe ratio - Entries 1,
+7, 8) are not to be touched again without new evidence specifically
+implicating one.
 
 Entry 7's probe-ratio-ordering fix was tried on a real
 energized cycle (Entry 8) and did **not** fix it - channel/trigger-edge
@@ -512,6 +527,90 @@ New tests: `test_force_trigger_sends_documented_command` (`test_scope_real.py`);
 `test_forced_diagnostic_capture_when_ter_still_zero`,
 `test_forced_diagnostic_capture_skipped_when_trigger_event_already_confirmed`
 (`test_sequencer.py`). Full suite: 327 tests, OK, same 2 intentional skips.
+
+---
+
+## Entry 12 - 2026-08-10 - Baseline TER check fix: clear-then-verify, not single-read
+
+**What was tried:** A real energized run of Entry 11's forced-diagnostic
+feature halted immediately with `scope_stale_trigger_event_before_arm`,
+before the cycle ever reached `arm_single()`. The Pi's working tree was
+confirmed clean except the expected untracked `camera_gate_check.yaml`
+(unrelated).
+
+**Root cause:** Entry 10's post-configure baseline check
+(`ccid/sequencer.py`, added before this entry) read `:TER?` exactly once
+and halted on any nonzero result. `:TER?` is a read-and-clear event
+register (confirmed against the Keysight manual in Entry 11): a single read
+cannot distinguish a genuinely stale event left over from a prior
+cycle/session - harmless, and cleared by the very act of reading it - from
+an actively faulty condition. The single-read design treated both cases
+identically and halted on what was very likely ordinary stale residue.
+
+**Fix (implemented test-first):**
+- `ccid/sequencer.py`'s baseline check now reads `:TER?` twice: the first
+  read clears any stale event; the second (verification) read decides the
+  halt. Proceeds to arm on `(1, 0)` or `(0, 0)`; halts with the existing
+  `scope_stale_trigger_event_before_arm` reason only on `(1, 1)` or `(0,
+  1)` - i.e., only when the register is still set immediately after having
+  just been cleared, which stale residue cannot produce but an active fault
+  (or a same-window race) can.
+- The pre-injection TER check (immediately before K3 close) is
+  **unchanged**, per instruction - it's a single read, and correctly so:
+  it should already be starting from the clean baseline this fix now
+  actually establishes, not from unknown prior state.
+- Forced-diagnostic timing (~100 ms after K3 closes), the 300 ms K3
+  backstop, safe-off ordering, and the diagnostic-only artifact rules
+  (Entry 11) are all untouched - this fix is scoped entirely to the
+  post-configure baseline check.
+- `ccid/hal/scope_sim.py` gained a second, distinct scenario flag:
+  `trigger_event_stuck_at_configure` (does not self-clear on read, models
+  an active/persistent condition) alongside the existing
+  `trigger_event_latched_at_configure` (self-clears on first read, models
+  genuine staleness) - the two need different fake behavior to test the
+  fix's two branches.
+
+**Test-first sequence:** updated `test_stale_trigger_event_before_arm_halts_before_arming`
+(renamed `test_stale_trigger_event_before_arm_is_cleared_and_does_not_halt`)
+to assert the stale-but-clearable scenario now completes normally instead
+of halting, and added `test_stuck_trigger_event_before_arm_halts_before_arming`
+and `test_trigger_event_between_baseline_reads_halts_before_arming` (the
+latter via a new fake, `_TriggerEventAppearsBetweenBaselineReadsScope`,
+returning `(0, 1)` across the two baseline reads) plus matching
+`test_faultmatrix.py` rows, all *before* touching `ccid/sequencer.py`. Ran
+them against the unmodified code first: the two tests directly probing the
+clear-then-verify behavior failed as expected (`RIG_FAULT` instead of
+`COMPLETE`; halted with `scope_trigger_event_before_injection` instead of
+`scope_stale_trigger_event_before_arm`, since the old single-read code let
+the `(0, 1)` case slip past the baseline check into the pre-injection
+check). Applied the fix, reran the same tests - all green. Also updated
+`_TriggeredButNeverCompletesScope` (`test_sequencer.py`), whose
+`_ter_calls` threshold assumed one baseline read; the baseline now consumes
+two, so its "only the forced-diagnostic checkpoint sees the trigger event"
+threshold moved from `> 2` to `> 3`.
+
+**Commit:** (pending)
+
+**Result:** Not yet tried against real hardware.
+
+**What this tells us:** Nothing about the actual no-trigger root cause -
+this is a correction to Entry 10's own instrumentation, the second time a
+TER-related check has needed a real-hardware trial to expose a flaw (the
+first being Entry 9's `:TRIGger:NREJect` rejection). The forced-diagnostic
+feature (Entry 11) itself was never reached on this run and remains
+untested; this fix's real test, together with Entry 11's, is the next
+energized cycle.
+
+New tests: `test_trigger_event_register_stuck_does_not_self_clear`
+(`test_scope_sim.py`);
+`test_stale_trigger_event_before_arm_is_cleared_and_does_not_halt` (renamed),
+`test_stuck_trigger_event_before_arm_halts_before_arming`,
+`test_trigger_event_between_baseline_reads_halts_before_arming`
+(`test_sequencer.py`);
+`test_scope_stuck_trigger_event_before_arm_row` (renamed),
+`test_scope_stale_trigger_event_before_arm_is_cleared_row`
+(`test_faultmatrix.py`). Full suite: 331 tests, OK, same 2 intentional
+skips.
 
 ---
 

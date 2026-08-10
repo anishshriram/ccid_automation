@@ -105,6 +105,19 @@ class ScopeSimTests(unittest.TestCase):
         # Read-and-clear: a second immediate read must not still be latched.
         self.assertFalse(scope.read_trigger_event_register())
 
+    def test_trigger_event_register_stuck_does_not_self_clear(self) -> None:
+        # Unlike trigger_event_latched_at_configure (stale, self-clearing),
+        # this models a persistent/active condition - repeated reads must
+        # keep returning True, never falling back to False on their own.
+        scope = ScopeSim(
+            scenario=ScopeSimScenario(trigger_event_stuck_at_configure=True),
+            monotonic_now=self.clock.now,
+        )
+        scope.connect()
+        scope.configure_for_cycle(ScopeSettings())
+        self.assertTrue(scope.read_trigger_event_register())
+        self.assertTrue(scope.read_trigger_event_register())
+
     def test_trigger_event_register_latched_before_injection(self) -> None:
         scope = ScopeSim(
             scenario=ScopeSimScenario(trigger_event_latched_before_injection=True),

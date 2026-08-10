@@ -426,11 +426,16 @@ class Sequencer:
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.SCOPE_CONFIGURING)
         self._scope.configure_for_cycle(self._scope_settings)
 
-        # A trigger event register already latched here means either stale
-        # state from a prior session/cycle or a spurious trigger during
-        # configuration - either way, the scope's state going into this
-        # cycle's arm is not the known-clean baseline the rest of this
-        # method assumes. Halt rather than arm against an unknown baseline.
+        # :TER? is a read-and-clear event register (confirmed in the
+        # Keysight manual, Entry 11): a single nonzero read here cannot
+        # distinguish a genuinely stale event left over from a prior
+        # cycle/session (harmless once cleared) from an active problem.
+        # Read twice - the first read clears any stale event, the second
+        # verifies the baseline is actually clean - and only halt if the
+        # *verification* read is still nonzero (SCOPE_TRIGGER_DEBUG_LOG.md
+        # Entry 12: a real forced-diagnostic run halted here on what turned
+        # out to be ordinary stale residue from a single-read check).
+        self._scope.read_trigger_event_register()
         if self._scope.read_trigger_event_register():
             self._open_mains_with_cooldown(context, include_cooldown=False)
             raise _SequencerHalt(

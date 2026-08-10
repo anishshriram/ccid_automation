@@ -43,8 +43,15 @@ class ScopeSimScenario:
     diagnostics_error_queue: tuple[str, ...] = field(default_factory=tuple)
     diagnostics_scope_png: bytes = b"\x89PNG\r\n\x1a\nSCOPE_SIM"
     # Simulates a stale trigger-event flag already latched when
-    # configure_for_cycle completes, before arm_single is ever called.
+    # configure_for_cycle completes, before arm_single is ever called -
+    # self-clearing on the first read, like a genuinely stale/leftover
+    # event on real hardware (:TER? is read-and-clear).
     trigger_event_latched_at_configure: bool = False
+    # Simulates a persistently/continuously set trigger event register at
+    # configure time - unlike trigger_event_latched_at_configure, this does
+    # NOT self-clear on read, modeling an active problem rather than stale
+    # residue (SCOPE_TRIGGER_DEBUG_LOG.md Entry 12).
+    trigger_event_stuck_at_configure: bool = False
     # Simulates a spurious trigger event occurring between arm_single and
     # the deliberate K3 close (the pre-injection recheck window).
     trigger_event_latched_before_injection: bool = False
@@ -67,6 +74,7 @@ class ScopeSim(ScopeInterface):
         self._armed_s: float | None = None
         self._acquire_started_s: float | None = None
         self._trigger_event_latched = False
+        self._trigger_event_stuck = False
         self._force_triggered = False
 
     def connect(self) -> None:
@@ -93,6 +101,7 @@ class ScopeSim(ScopeInterface):
         self._armed_s = None
         self._acquire_started_s = None
         self._trigger_event_latched = self._scenario.trigger_event_latched_at_configure
+        self._trigger_event_stuck = self._scenario.trigger_event_stuck_at_configure
         self._force_triggered = False
 
     def readback_settings(self) -> dict[str, str]:
@@ -162,6 +171,10 @@ class ScopeSim(ScopeInterface):
     def read_trigger_event_register(self) -> bool:
         self._require_connected()
         self._maybe_raise("trigger_event_register")
+        if self._trigger_event_stuck:
+            # Does not self-clear - models a persistent/active condition,
+            # not stale residue.
+            return True
         latched = self._trigger_event_latched
         self._trigger_event_latched = False
         return latched

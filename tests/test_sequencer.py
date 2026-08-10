@@ -187,15 +187,30 @@ class _TriggeredButNeverCompletesScope(ScopeSim):
 
     def read_trigger_event_register(self) -> bool:
         self._ter_calls += 1
-        # First two live checkpoints (post-configure baseline,
-        # pre-injection recheck) must see a clean 0 so the cycle reaches
-        # K3 close; only the forced-diagnostic checkpoint after K3 closes
-        # should see the (simulated) real trigger event.
-        return self._ter_calls > 2
+        # The first three live reads (post-configure baseline clear +
+        # verify, pre-injection recheck) must see a clean 0 so the cycle
+        # reaches K3 close; only the forced-diagnostic checkpoint after K3
+        # closes should see the (simulated) real trigger event.
+        return self._ter_calls > 3
 
     def force_trigger(self) -> None:
         self.force_trigger_calls += 1
         super().force_trigger()
+
+
+class _TriggerEventAppearsBetweenBaselineReadsScope(ScopeSim):
+    """TER reads 0 on the baseline-clearing read but 1 on the immediate
+    verification read - a real event occurring in the narrow window
+    between the two reads rather than stale residue from before either.
+    Must still halt before arming (SCOPE_TRIGGER_DEBUG_LOG.md Entry 12)."""
+
+    def __init__(self, *, clock: _ManualClock, scenario: ScopeSimScenario) -> None:
+        super().__init__(scenario=scenario, monotonic_now=clock.now)
+        self._ter_calls = 0
+
+    def read_trigger_event_register(self) -> bool:
+        self._ter_calls += 1
+        return self._ter_calls >= 2
 
 
 class _TwoHueCamera:
@@ -530,11 +545,40 @@ class SequencerTests(unittest.TestCase):
         self.assertEqual(scope.force_trigger_calls, 0)
         self.assertFalse((run_dir / "diagnostics" / "1" / "forced_diagnostic_state.json").exists())
 
-    def test_stale_trigger_event_before_arm_halts_before_arming(self) -> None:
+    def test_stale_trigger_event_before_arm_is_cleared_and_does_not_halt(self) -> None:
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 12: a real forced-diagnostic run
+        # halted here on ordinary stale TER residue from a single-read
+        # check. :TER? is read-and-clear, so a self-clearing stale event
+        # (1, 0 across the two baseline reads) must be cleared and the
+        # cycle must proceed normally, not halt.
         run_dir, state = self._initialize(target_cycles=1)
         camera = _ScriptedCamera([LedState.CHARGING] * 120)
         contactors = GpioSimContactorController(monotonic_now=self.clock.now)
-        scenario = self._scope_scenario(trigger_event_latched_at_configure=True)
+        scenario = self._scope_scenario(
+            trigger_event_latched_at_configure=True, trip_time_s=0.010
+        )
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        self.assertEqual(result.cycles[0].terminal, Terminal.PASS)
+        operations = [event.operation for event in contactors.events()]
+        self.assertIn("close_k3", operations)
+
+    def test_stuck_trigger_event_before_arm_halts_before_arming(self) -> None:
+        # A verification read that is *still* nonzero after the first
+        # clearing read (1, 1 - or 0, 1 for a same-window race) means an
+        # active problem, not stale residue, and must still halt before
+        # arming.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(trigger_event_stuck_at_configure=True)
         sequencer = self._make_sequencer(
             camera=camera,
             scope_scenario=scenario,
@@ -551,6 +595,26 @@ class SequencerTests(unittest.TestCase):
         self.assertFalse(snapshot[ContactorName.K1])
         self.assertFalse(snapshot[ContactorName.K2])
         self.assertFalse(snapshot[ContactorName.K3])
+
+    def test_trigger_event_between_baseline_reads_halts_before_arming(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario()
+        scope = _TriggerEventAppearsBetweenBaselineReadsScope(clock=self.clock, scenario=scenario)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertIn("scope_stale_trigger_event_before_arm", result.halt_reason or "")
+        operations = [event.operation for event in contactors.events()]
+        self.assertNotIn("close_k3", operations)
 
     def test_trigger_event_before_injection_never_closes_k3(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)
