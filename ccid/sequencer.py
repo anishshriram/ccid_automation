@@ -585,11 +585,11 @@ class Sequencer:
         k3_deadline = k3_closed_s + self._config.timing.k3_backstop_s
         forced_diagnostic_deadline = k3_closed_s + _FORCED_DIAGNOSTIC_DELAY_S
         opened = False
-        forced_diagnostic_attempted = False
+        forced_diagnostic_checked = False
         while self._now() - start_s <= acq_timeout_s:
             now_s = self._now()
             if (
-                not forced_diagnostic_attempted
+                not forced_diagnostic_checked
                 and not opened
                 and now_s >= forced_diagnostic_deadline
             ):
@@ -598,7 +598,18 @@ class Sequencer:
                 # _issue_forced_diagnostic_trigger. The actual waveform/PNG
                 # transfer is deferred until after full safe-off so it can
                 # never delay the backstop check just below.
-                forced_diagnostic_attempted = True
+                #
+                # This only *checks* whether forcing is needed - a TER
+                # already read as 1 here means a real trigger occurred and
+                # _issue_forced_diagnostic_trigger deliberately does NOT
+                # force in that case. That must not be conflated with
+                # "forcing happened" (SCOPE_TRIGGER_DEBUG_LOG.md Entry 15):
+                # an earlier version of this loop treated "checked" and
+                # "forced" as the same thing and permanently stopped
+                # polling for real completion the moment this checkpoint
+                # ran, discarding a genuine natural trigger whose
+                # acquisition went on to complete normally.
+                forced_diagnostic_checked = True
                 self._issue_forced_diagnostic_trigger(context)
             if not opened and now_s >= k3_deadline:
                 self._transition(
@@ -612,25 +623,23 @@ class Sequencer:
                 context.k3_open_reason = "backstop"
                 self._record_diagnostic_stage(context, "k3_open")
                 opened = True
-            if forced_diagnostic_attempted:
-                # A forced trigger consumes the same single-shot
-                # acquisition a real measurement would use -
+            if context.force_command_return_monotonic_s is not None:
+                # A trigger was actually forced - this, not merely having
+                # run the checkpoint above, is what consumes the same
+                # single-shot acquisition a real measurement would use.
                 # wait_until_acquisition_complete can no longer distinguish
-                # "genuinely triggered" from "we just forced it," so once
-                # forced this loop must never again treat "complete" as a
-                # real measurement success (SCOPE_TRIGGER_DEBUG_LOG.md
-                # Entry 11). It still only returns via the backstop/timeout
-                # paths below, exactly as an unforced no-trigger cycle
-                # already does.
+                # "genuinely triggered" from "we just forced it," so once a
+                # trigger has actually been forced this loop must never
+                # again treat "complete" as a real measurement success
+                # (SCOPE_TRIGGER_DEBUG_LOG.md Entry 11). It still only
+                # returns via the backstop/timeout paths below, exactly as
+                # an unforced no-trigger cycle already does.
                 #
                 # Diagnostic-only: watch (via the loop's existing ~10 ms
                 # cadence, no extra polling loop) for the run bit clearing
                 # after a successful force, purely to record when it
                 # happened - never to decide "acquired." See Entry 13.
-                if (
-                    context.force_command_return_monotonic_s is not None
-                    and context.forced_acquisition_completion_monotonic_s is None
-                ):
+                if context.forced_acquisition_completion_monotonic_s is None:
                     try:
                         condition = self._scope.read_operation_condition()
                     except Exception:

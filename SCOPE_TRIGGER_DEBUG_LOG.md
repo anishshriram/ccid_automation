@@ -10,6 +10,25 @@ up to date rather than buried at the bottom.
 
 ## Current status (as of 2026-08-10)
 
+**Entry 15: a real software bug was discarding successful, naturally-triggered
+acquisitions - fixed, and it may have contaminated some of this
+investigation's own evidence.** The forced-diagnostic loop conflated
+"checked whether forcing was needed" with "a trigger was actually forced":
+once the ~100 ms checkpoint ran, the loop unconditionally stopped polling
+for real acquisition completion, even on the branch where the TER gate-read
+found a trigger had already occurred naturally and correctly skipped
+forcing. If that real trigger's acquisition then completed - the actual
+desired outcome - the loop never noticed, and the cycle was reported as a
+failure anyway. Fixed by gating "stop polling for real completion" on
+whether forcing actually happened (`force_command_return_monotonic_s is not
+None`), not on whether the checkpoint merely ran. **Untested against real
+hardware**, but this means: any past halt whose forced-diagnostic checkpoint
+ran on a cycle that was *actually* about to succeed naturally may have been
+misreported as a failure by this bug, not by a genuine no-trigger condition.
+Past entries are left as originally recorded (that is what actually
+happened at the time), but this caveat should be kept in mind when
+interpreting any of them where the forced-diagnostic checkpoint fired.
+
 **Best evidence yet, likely the leakage waveform itself - do not touch
 normal trigger settings.** Entry 12's baseline-check fix let a real
 forced-diagnostic run reach K3 close and force successfully. The forced
@@ -773,6 +792,73 @@ New tests: `test_scope_consumed_during_diagnostic_delay_never_closes_k3`
 the expected per-stage list in
 `test_forced_diagnostic_capture_when_ter_still_zero` to include the two new
 stages. Full suite: 341 tests, OK, same 2 intentional skips.
+
+---
+
+## Entry 15 - 2026-08-10 - Fixed: a real natural trigger success was being discarded by the forced-diagnostic loop
+
+**What was tried:** Code review (prompted by the operator noticing the
+software discarding a cycle where "the scope naturally triggered, completed
+the acquisition, and stopped") of `_poll_acquisition_with_backstop` and
+`_issue_forced_diagnostic_trigger`.
+
+**Root cause:** `_poll_acquisition_with_backstop` used a single flag,
+`forced_diagnostic_attempted`, for two different facts that had been
+conflated: (1) "the ~100 ms checkpoint has run" and (2) "a trigger was
+actually forced." The flag was set to `True` unconditionally the moment the
+checkpoint ran, *before* `_issue_forced_diagnostic_trigger` even checked
+TER. Inside that method, if the TER gate-read found `1` (a real trigger had
+already occurred), the method correctly skipped calling `force_trigger()` -
+but the outer loop had no way to know that, and its
+`if forced_diagnostic_attempted: ... continue` branch unconditionally
+stopped calling `wait_until_acquisition_complete()` for the rest of the
+cycle regardless. So on exactly the branch where a real trigger was
+discovered and forcing was correctly skipped, the loop *also* permanently
+stopped checking for real completion - meaning a naturally-triggered
+acquisition that went on to complete normally (the actual desired outcome)
+was never noticed, and the cycle was reported as failed (`acquired=False`)
+anyway.
+
+This is different from, and does not affect the validity of, Entry 12's
+`TER=0` finding (a genuine no-trigger condition confirmed for the full
+window - the bug never had a chance to fire there, since no trigger ever
+occurred) or Entry 13's forced-capture waveform (also unaffected - that
+cycle's TER was 0 at the gate-check, so forcing genuinely did happen and
+the "stop polling" branch was correctly taken). It specifically affects any
+cycle where a real trigger happened to be discovered exactly at or after
+the ~100 ms checkpoint and the acquisition then completed - such a cycle
+would have been silently misreported as a rig fault.
+
+**Fix:** The loop's "stop polling for real completion" branch is now gated
+on `context.force_command_return_monotonic_s is not None` (forcing actually
+happened) instead of the checkpoint-ran flag (renamed
+`forced_diagnostic_checked` to make clear it no longer implies forcing).
+When the gate-read finds TER already `1`, the loop now falls straight
+through to the normal `wait_until_acquisition_complete()` check on that
+same tick and every tick after, exactly as an unforced cycle already does -
+so a real trigger discovered at the checkpoint is now treated exactly like
+one discovered a moment earlier or later would be. No trigger-condition
+setting, the 300 ms K3 backstop, or safe-off ordering were touched.
+
+**Commit:** (pending)
+
+**Result:** Not yet tried against real hardware.
+
+**What this tells us:** This was a real, previously-undiscovered defect in
+the investigation's own tooling, not evidence about the scope. It does not
+retroactively invalidate Entries 12 or 13 (reasoned through above), but it
+does mean any other halted cycle whose forced-diagnostic checkpoint ran
+should not be assumed to prove a genuine failure without checking whether
+this bug could have masked a real success - none is currently known to have
+been affected, since Entries 12 and 13 are both independently accounted
+for, but this caveat is recorded here for anyone reviewing earlier raw run
+data.
+
+New test: `test_natural_trigger_discovered_at_forced_checkpoint_still_counts_as_success`
+(new `_NaturallyTriggeredAtForcedCheckpointScope` fake, `test_sequencer.py`)
+- confirmed failing against the pre-fix code (`RIG_FAULT` when it should not
+be) before the fix, passing after. Full suite: 342 tests, OK, same 2
+intentional skips.
 
 ---
 

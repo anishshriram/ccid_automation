@@ -11,7 +11,14 @@ import numpy as np
 
 from ccid.classify import LedColor, frames_to_bgr_bytes, make_led_frame
 from ccid.config import AppConfig, TimingConfig, VisionConfig, load_config
-from ccid.hal.base import CameraFrame, CameraHealth, CameraStateSample, ContactorName, ScopeTimeoutDiagnostics
+from ccid.hal.base import (
+    CameraFrame,
+    CameraHealth,
+    CameraStateSample,
+    ContactorName,
+    ScopeStatus,
+    ScopeTimeoutDiagnostics,
+)
 from ccid.hal.gpio_sim import GpioSimContactorController
 from ccid.hal.scope_real import ScopeConfigurationError
 from ccid.hal.scope_sim import ScopeSim, ScopeSimScenario
@@ -213,6 +220,35 @@ class _TriggeredButNeverCompletesScope(ScopeSim):
     def force_trigger(self) -> None:
         self.force_trigger_calls += 1
         super().force_trigger()
+
+
+class _NaturallyTriggeredAtForcedCheckpointScope(ScopeSim):
+    """TER already reads 1 by the time the forced-diagnostic checkpoint
+    runs (a real trigger occurred), and the acquisition genuinely completes
+    from that point on - SCOPE_TRIGGER_DEBUG_LOG.md Entry 15 regression:
+    the checkpoint correctly skips forcing here, and that must not be
+    confused with "a trigger was forced," which would otherwise stop the
+    loop from ever noticing this real success."""
+
+    def __init__(self, *, clock: _ManualClock, scenario: ScopeSimScenario) -> None:
+        super().__init__(scenario=scenario, monotonic_now=clock.now)
+        self.force_trigger_calls = 0
+        self._ter_calls = 0
+
+    def read_trigger_event_register(self) -> bool:
+        self._ter_calls += 1
+        return self._ter_calls > 3
+
+    def force_trigger(self) -> None:
+        self.force_trigger_calls += 1
+        super().force_trigger()
+
+    def wait_until_acquisition_complete(self, timeout_s: float, now_monotonic_s: float) -> bool:
+        if self._ter_calls > 3:
+            self._status = ScopeStatus.COMPLETE
+            return True
+        self._status = ScopeStatus.ACQUIRING
+        return False
 
 
 class _TriggerEventAppearsBetweenBaselineReadsScope(ScopeSim):
@@ -622,6 +658,38 @@ class SequencerTests(unittest.TestCase):
         self.assertEqual(result.terminal, Terminal.RIG_FAULT)
         self.assertIn("scope_triggered_but_acquisition_not_completed", result.halt_reason or "")
         self.assertEqual(scope.force_trigger_calls, 0)
+        self.assertFalse((run_dir / "diagnostics" / "1" / "forced_diagnostic_state.json").exists())
+
+    def test_natural_trigger_discovered_at_forced_checkpoint_still_counts_as_success(self) -> None:
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 15: a real bug conflated "the
+        # forced-diagnostic checkpoint ran" with "a trigger was forced."
+        # When the checkpoint's TER gate-read found a real trigger already
+        # occurred (so forcing was correctly skipped), the loop nonetheless
+        # stopped polling for real completion forever, discarding a
+        # genuinely successful, naturally-triggered acquisition. This must
+        # now complete normally: K3 opens "normal" (not backstop), the
+        # cycle is never a RIG_FAULT, and force_trigger() is never called.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(trip_time_s=0.010)
+        scope = _NaturallyTriggeredAtForcedCheckpointScope(clock=self.clock, scenario=scenario)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertNotEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertEqual(scope.force_trigger_calls, 0)
+        operations = [event.operation for event in contactors.events()]
+        self.assertIn("close_k3", operations)
+
+        scope_state_path = run_dir / "diagnostics" / "1" / "scope_state.json"
+        self.assertFalse(scope_state_path.exists())
         self.assertFalse((run_dir / "diagnostics" / "1" / "forced_diagnostic_state.json").exists())
 
     def test_stale_trigger_event_before_arm_is_cleared_and_does_not_halt(self) -> None:
