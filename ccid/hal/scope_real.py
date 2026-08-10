@@ -88,6 +88,10 @@ class ScopeReal(ScopeInterface):
             f":CHANnel1:COUPling {settings.channel1_coupling}",
             f":CHANnel1:PROBe {settings.channel1_probe_ratio}",
             f":TRIGger:SWEep {settings.trigger_sweep}",
+            # :TRIGger:EDGE:* parameters are inert unless :TRIGger:MODE is
+            # explicitly EDGE - the scope keeps triggering on whatever mode
+            # (Pattern, Glitch, etc.) it was last left on via the front panel.
+            ":TRIGger:MODE EDGE",
             f":TRIGger:EDGE:SOURce {settings.trigger_source}",
             f":TRIGger:EDGE:LEVel {settings.trigger_level_v}",
             f":TRIGger:EDGE:SLOPe {settings.trigger_slope}",

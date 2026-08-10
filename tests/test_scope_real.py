@@ -118,6 +118,40 @@ class ScopeRealTests(unittest.TestCase):
         self.assertEqual(rm.inst.run_bit_sequence, [])
         self.assertEqual(scope.status(), ScopeStatus.CONFIGURED)
 
+    def test_configure_sets_trigger_mode_edge_before_edge_parameters(self) -> None:
+        # Regression: :TRIGger:EDGE:* commands are inert unless :TRIGger:MODE
+        # is explicitly EDGE first - the scope otherwise keeps triggering on
+        # whatever mode was last left active on the front panel.
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        now_s = [0.0]
+
+        def monotonic() -> float:
+            now_s[0] += 0.02
+            return now_s[0]
+
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=monotonic,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.configure_for_cycle(ScopeSettings())
+
+        self.assertIn(":TRIGger:MODE EDGE", rm.inst.commands)
+        mode_index = rm.inst.commands.index(":TRIGger:MODE EDGE")
+        edge_param_commands = [
+            cmd for cmd in rm.inst.commands if cmd.startswith(":TRIGger:EDGE:")
+        ]
+        self.assertTrue(edge_param_commands, "expected :TRIGger:EDGE:* parameter commands")
+        for cmd in edge_param_commands:
+            self.assertGreater(
+                rm.inst.commands.index(cmd),
+                mode_index,
+                f"{cmd} must be sent after :TRIGger:MODE EDGE",
+            )
+
     def test_parse_preamble(self) -> None:
         parsed = _parse_keysight_preamble("0,0,1000,1,1e-7,-0.02,0,1,-128,0")
         self.assertEqual(parsed["points"], 1000)
