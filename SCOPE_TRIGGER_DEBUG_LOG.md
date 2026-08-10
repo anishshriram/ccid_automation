@@ -18,14 +18,19 @@ The first version of timeout diagnostics capture (Entry 2) wedged the real
 scope's USBTMC interface badly enough to require a physical AC power cycle
 to recover (Entry 3). A corrective version (Entry 4) reorders diagnostics
 to run only after full safe-off and adds a hard per-query timeout,
-fail-fast-on-first-failure, and a device-clear-first step. **This
-corrective version is verified only in the simulator/unit tests - it has
-not yet been re-tested against the real scope.** Given what happened last
-time, do not assume it is safe on real hardware just because the tests
-pass. The next de-energized dry run should specifically watch for: does
-`.clear()` succeed on this instrument/backend, does the hard timeout
-actually bound a real slow/wedged query, and does the scope survive the
-attempt in a state where `*IDN?` still responds afterward.
+fail-fast-on-first-failure, and a device-clear-first step.
+
+That corrective version was dry-run against the real scope (Entry 5): it
+completed in 0.001s without wedging anything, and `*IDN?` still worked
+afterward - the sequencing/timeout fix works. The only issue found was
+that PyVISA-Py doesn't implement `.clear()` on this backend
+(`VI_ERROR_NSUP_OPER`), which the fail-fast logic was treating as "abort
+everything," so diagnostics never even reached the queries. Fixed in
+Entry 5 to specifically recognize that error as "clear unsupported" and
+proceed anyway. **That specific fix has not yet been re-run against real
+hardware** - the next dry run should confirm diagnostics now actually
+populates settings/error-queue/screenshot instead of stopping at the
+clear step.
 
 ---
 
@@ -152,11 +157,23 @@ A true cold restart of the oscilloscope, including removing its AC power for 60 
    - Behavior changed from best-effort-continue-on-every-field to **fail-fast**: the first query failure (including a failed device clear) now aborts the entire capture immediately rather than continuing to fire more queries at a potentially unhealthy connection. Entry 3's evidence is that continuing after a failure is what plausibly desynced the USBTMC session badly enough to need a physical power cycle.
    - Added a `self._inst.clear()` (VISA/USBTMC device clear) as the very first operation, before any query - the standard fix for a desynced write/read session. If it fails, diagnostics aborts immediately without sending a single query.
 
-**Commit:** (pending)
+**Commit:** `27d5c71`
 
 **Testing:** 7 new/rewritten tests in `test_scope_real.py` (device-clear-first, abort-on-clear-failure, fail-fast-after-first-failure, hard per-query timeout via an actually-slow fake query, total-budget enforcement) and one new test in `test_sequencer.py` - `test_diagnostics_capture_happens_only_after_full_safe_off` - which snapshots commanded contactor state at the exact moment diagnostics capture is invoked and asserts K1, K2, and K3 are all open. This is the test that would have caught the Entry 3 incident directly; it did not exist before this entry. Full suite: 297 tests, OK, same 2 intentional skips. All software-only.
 
 **What this tells us:** Nothing new about the scope's actual no-trigger root cause - this only corrects a defect in the diagnostics tooling itself. **Not yet verified against real hardware** - the device-clear call, the per-query timeout's interaction with the real USBTMC backend, and whether the fail-fast behavior actually prevents a repeat of Entry 3 are all unconfirmed. Treat the next real-scope dry run as the first real test of this fix, not a formality.
+
+---
+
+## Entry 5 - 2026-08-10 - Real dry run of the corrective fix: sequencing/timeout works, `.clear()` is unsupported on this backend
+
+**What was tried:** A real de-energized dry run of the Entry 4 corrective diagnostics implementation against the physical MSO-X 2014A.
+
+**Result:** Completed in 0.001s - no wedging, no hang. `self._inst.clear()` raised `VI_ERROR_NSUP_OPER` (PyVISA-Py does not implement device clear on this backend/resource type). Because the fail-fast logic treated *any* clear failure as grounds to abort, diagnostics stopped immediately without sending a single query. A subsequent `*IDN?` succeeded, confirming the scope's communication stayed healthy throughout - unlike Entry 3, nothing was left in a bad state.
+
+**Commit:** (pending)
+
+**What this tells us:** The sequencing fix (diagnostics after full safe-off) and the hard-timeout mechanism both hold up on real hardware - the 0.001s completion time and healthy post-run `*IDN?` are exactly what Entry 4 needed to confirm. The only defect was treating "clear not supported by this backend" the same as "clear failed because the connection is unhealthy," which are not the same thing. Fixed: `VI_ERROR_NSUP_OPER` specifically is now recorded in `settings["device_clear"]` and diagnostics proceeds to the normal bounded, fail-fast queries; every other clear failure still aborts immediately as before. Safe-off ordering, per-query timeout, total deadline, and the primary halt reason were all left unchanged. New regression test: `test_timeout_diagnostics_continues_when_device_clear_unsupported`. Not yet re-verified against real hardware - the next dry run should confirm diagnostics actually reaches and populates the settings/error-queue/screenshot fields now, not just that it stops cleanly at the clear step.
 
 ---
 

@@ -19,6 +19,7 @@ class _FakeInstrument:
         self._error_queue_calls = 0
         self.fail_png = False
         self.fail_clear = False
+        self.clear_error_text = "simulated VISA timeout for clear"
         self.clear_calls = 0
 
     def write(self, command: str) -> None:
@@ -27,7 +28,7 @@ class _FakeInstrument:
     def clear(self) -> None:
         self.clear_calls += 1
         if self.fail_clear:
-            raise TimeoutError("simulated VISA timeout for clear")
+            raise TimeoutError(self.clear_error_text)
 
     def query(self, command: str) -> str:
         if command in self.slow_commands:
@@ -272,6 +273,32 @@ class ScopeRealTests(unittest.TestCase):
         self.assertIn("device clear failed", diagnostics.settings["diagnostics_aborted"])
         self.assertEqual(diagnostics.operation_condition, -1)
         self.assertEqual(diagnostics.scope_png, b"")
+
+    def test_timeout_diagnostics_continues_when_device_clear_unsupported(self) -> None:
+        # Confirmed on a real de-energized dry run against the MSO-X 2014A:
+        # PyVISA-Py raises VI_ERROR_NSUP_OPER for .clear() on this
+        # backend/resource type - that's "not implemented," not evidence of
+        # an unhealthy connection, so diagnostics should proceed to the
+        # normal bounded, fail-fast queries rather than aborting.
+        rm = _FakeRM()
+        rm.inst.fail_clear = True
+        rm.inst.clear_error_text = "VI_ERROR_NSUP_OPER (-1073807360): The specified operation is not supported."
+        rm.inst.run_bit_sequence = [0]
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        diagnostics = scope.capture_timeout_diagnostics()
+
+        self.assertEqual(rm.inst.clear_calls, 1)
+        self.assertIn("unsupported by this VISA backend", diagnostics.settings["device_clear"])
+        self.assertNotIn("diagnostics_aborted", diagnostics.settings)
+        self.assertEqual(diagnostics.settings["trigger_mode"], "EDGE")
+        self.assertEqual(diagnostics.operation_condition, 0)
+        self.assertTrue(diagnostics.scope_png.startswith(b"\x89PNG"))
 
     def test_timeout_diagnostics_enforces_hard_per_query_timeout(self) -> None:
         rm = _FakeRM()

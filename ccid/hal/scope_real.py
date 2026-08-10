@@ -42,6 +42,14 @@ _DIAGNOSTIC_SETTINGS_QUERIES: tuple[tuple[str, str], ...] = (
 
 _DIAGNOSTIC_ERROR_QUEUE_MAX_READS = 20
 
+# PyVISA-Py raises this for `.clear()` on backends/resource types that don't
+# implement a device clear at all (confirmed on a real de-energized dry
+# run - see SCOPE_TRIGGER_DEBUG_LOG.md Entry 5). That is not evidence the
+# connection is unhealthy, unlike every other clear failure, so it is the
+# one case where diagnostics proceeds to the bounded, fail-fast queries
+# instead of aborting.
+_VI_ERROR_NSUP_OPER_MARKER = "VI_ERROR_NSUP_OPER"
+
 
 class ScopeRealError(HardwareInterfaceError):
     pass
@@ -242,12 +250,15 @@ class ScopeReal(ScopeInterface):
         # fully wedged USBTMC session (a stale unread response left in the
         # instrument's output buffer desyncs every subsequent write/read
         # pair) - recoverable, in that incident, only by physically
-        # power-cycling the scope. So the first failure here - including a
-        # failed device clear - aborts the whole capture immediately rather
-        # than pushing more queries into a connection that may already be
-        # unhealthy. Every single query is also individually bounded via
-        # `_run_with_timeout`, since PyVISA's own configured timeout did not
-        # reliably bound a wedged call in that incident.
+        # power-cycling the scope. So the first failure here aborts the
+        # whole capture immediately rather than pushing more queries into a
+        # connection that may already be unhealthy - except a device clear
+        # that fails with VI_ERROR_NSUP_OPER, which just means this backend
+        # doesn't implement clear at all (confirmed on real hardware, see
+        # Entry 5) and is not evidence of an unhealthy connection. Every
+        # single query is also individually bounded via `_run_with_timeout`,
+        # since PyVISA's own configured timeout did not reliably bound a
+        # wedged call in the Entry 3 incident.
         if self._inst is None:
             return ScopeTimeoutDiagnostics(
                 captured_at_utc=datetime.now(tz=timezone.utc),
@@ -267,16 +278,19 @@ class ScopeReal(ScopeInterface):
 
         _, clear_error = _run_with_timeout(self._inst.clear, self._diagnostics_query_timeout_s)
         if clear_error is not None:
-            settings["diagnostics_aborted"] = f"device clear failed, aborting: {clear_error}"
-            return ScopeTimeoutDiagnostics(
-                captured_at_utc=datetime.now(tz=timezone.utc),
-                captured_at_monotonic_s=self._now(),
-                operation_condition=-1,
-                hal_status=self._status.value,
-                settings=settings,
-                error_queue=(),
-                scope_png=b"",
-            )
+            if _VI_ERROR_NSUP_OPER_MARKER in clear_error:
+                settings["device_clear"] = f"unsupported by this VISA backend, skipped: {clear_error}"
+            else:
+                settings["diagnostics_aborted"] = f"device clear failed, aborting: {clear_error}"
+                return ScopeTimeoutDiagnostics(
+                    captured_at_utc=datetime.now(tz=timezone.utc),
+                    captured_at_monotonic_s=self._now(),
+                    operation_condition=-1,
+                    hal_status=self._status.value,
+                    settings=settings,
+                    error_queue=(),
+                    scope_png=b"",
+                )
 
         aborted = False
         for key, command in _DIAGNOSTIC_SETTINGS_QUERIES:
