@@ -45,6 +45,14 @@ mapping was unsupported. Entry 13:
 **Untested against real hardware** - the next energized cycle is the first
 real test of the corrected metadata and the waveform-native burst analysis.
 
+Entry 14 adds a diagnostic-only 1 s dwell between the second armed check and
+K3 close, followed by one final armed-state and TER recheck (same halt
+reasons as the existing pre-injection checks, since it's the same
+underlying condition just possibly caught later) - purely to observe
+whether armed-state or TER change over a longer pre-injection window than
+has been checked before. No trigger setting was touched. **Untested against
+real hardware.**
+
 Entry 7's probe-ratio-ordering fix was tried on a real
 energized cycle (Entry 8) and did **not** fix it - channel/trigger-edge
 settings all read back exactly as configured (trigger mode EDGE, source
@@ -716,6 +724,55 @@ expanded assertions (timestamp ordering, full stage-timeline coverage,
 `test_forced_diagnostic_capture_when_ter_still_zero`
 (`test_sequencer.py`). Full suite: 340 tests, OK, same 2 intentional
 skips.
+
+---
+
+## Entry 14 - 2026-08-10 - Diagnostic-only 1 s pre-injection dwell plus a final armed/TER recheck
+
+**What was tried:** Added a longer, deliberate pause between the existing
+second armed check and K3 close, to observe whether armed-state or TER
+change over a longer pre-injection window than any previous check has
+covered (the existing settle window is 50 ms). No trigger-condition setting
+(mode, coupling, edge source/slope/level, probe ratio) was touched.
+
+**Implementation** (`ccid/sequencer.py`, in `_attempt_cycle`, between the
+existing `armed_observation_2` check and the existing `pre_injection_ter_read`
+check, which remains exactly where it was - immediately before K3 close):
+- `self._sleep(1.0)` - diagnostic-only dwell, recorded as a new
+  `"pre_injection_diagnostic_delay"` stage in the per-stage timeline
+  (Entry 13).
+- A final armed-state recheck (`_poll_scope_armed()`), recorded as
+  `"armed_observation_3"` on success. On failure, halts with the same
+  `scope_lost_armed_before_injection` reason the existing armed rechecks
+  already use - deliberately not a new reason, since a Single consumed
+  during this longer window is the same underlying condition as one
+  consumed during the existing 50 ms window, just possibly caught later.
+- The existing `pre_injection_ter_read` TER check is unchanged in logic and
+  halt reason (`scope_trigger_event_before_injection`); it now simply runs
+  after the delay and the new armed recheck instead of immediately after
+  `armed_observation_2`, and is still the last thing checked before K3
+  closes.
+
+Nothing about the 300 ms K3 backstop, safe-off ordering, or the
+forced-diagnostic gate/timing (Entry 11) was touched - this entry only adds
+a checkpoint before K3, symmetrically with the delay it precedes.
+
+**Commit:** (pending)
+
+**Result:** Not yet tried against real hardware.
+
+**What this tells us:** Nothing yet by itself - this is another
+observability addition, not a new hypothesis. Its value is in whether the
+next real cycle's armed-state or TER ever change during the added second of
+dwell (which would be new evidence about timing) versus staying exactly as
+they were at `armed_observation_2` (which would rule out a slow-developing
+condition in this specific window).
+
+New tests: `test_scope_consumed_during_diagnostic_delay_never_closes_k3`
+(new `_ArmedThenConsumedAfterDelayScope` fake, `test_sequencer.py`); updated
+the expected per-stage list in
+`test_forced_diagnostic_capture_when_ter_still_zero` to include the two new
+stages. Full suite: 341 tests, OK, same 2 intentional skips.
 
 ---
 

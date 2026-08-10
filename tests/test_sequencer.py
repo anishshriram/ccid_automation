@@ -137,6 +137,23 @@ class _ArmedThenConsumedScope(ScopeSim):
 
         return False
 
+
+class _ArmedThenConsumedAfterDelayScope(ScopeSim):
+    """Scope that stays armed through the first two armed checks but is
+    consumed by the time the third (post-diagnostic-delay) check runs -
+    SCOPE_TRIGGER_DEBUG_LOG.md Entry 14's new final armed-state recheck."""
+
+    def __init__(self, *, clock: _ManualClock, scenario: ScopeSimScenario) -> None:
+        super().__init__(scenario=scenario, monotonic_now=clock.now)
+        self.armed_checks = 0
+
+    def wait_until_armed(self, timeout_s: float, now_monotonic_s: float) -> bool:
+        self.armed_checks += 1
+        if self.armed_checks <= 2:
+            return super().wait_until_armed(timeout_s=timeout_s, now_monotonic_s=now_monotonic_s)
+        return False
+
+
 class _FailingDiagnosticsScope(ScopeSim):
     """Scope whose timeout-diagnostics capture always raises, for proving
     safe-off and the primary halt reason survive a diagnostics failure."""
@@ -544,6 +561,8 @@ class SequencerTests(unittest.TestCase):
                 "single_command_return",
                 "armed_observation_1",
                 "armed_observation_2",
+                "pre_injection_diagnostic_delay",
+                "armed_observation_3",
                 "pre_injection_ter_read",
                 "k3_close",
                 "forced_diagnostic_ter_gate_read",
@@ -851,6 +870,34 @@ class SequencerTests(unittest.TestCase):
         )
         self.assertNotIn("close_k3", operations)
         self.assertGreaterEqual(scope.armed_checks, 2)
+
+    def test_scope_consumed_during_diagnostic_delay_never_closes_k3(self) -> None:
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 14: armed state lost specifically
+        # during the new 1 s diagnostic delay (caught only by the new third
+        # armed check, not the existing first/second checks) must still
+        # halt before K3 close, reusing the same halt reason as the
+        # existing armed-loss checks.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 200)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(trip_time_s=0.010)
+        scope = _ArmedThenConsumedAfterDelayScope(clock=self.clock, scenario=scenario)
+
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        operations = [event.operation for event in contactors.events()]
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertIn("scope_lost_armed_before_injection", result.halt_reason or "")
+        self.assertNotIn("close_k3", operations)
+        self.assertGreaterEqual(scope.armed_checks, 3)
 
     def test_k3_backstop_opens_before_blocking_acquisition_timeout(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)

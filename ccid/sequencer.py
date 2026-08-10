@@ -495,10 +495,33 @@ class Sequencer:
             )
         self._record_diagnostic_stage(context, "armed_observation_2")
 
-        # Same intent as the armed recheck above, via a second, independent
+        # Diagnostic-only dwell (SCOPE_TRIGGER_DEBUG_LOG.md Entry 14): a
+        # longer pause than the 50 ms settle above, purely to observe
+        # whether armed-state or TER change over a longer pre-injection
+        # window than has been checked before. Does not change any trigger
+        # setting or the K3/backstop timing that follows.
+        self._sleep(1.0)
+        self._record_diagnostic_stage(context, "pre_injection_diagnostic_delay")
+
+        # Final armed-state recheck after the diagnostic delay - same
+        # consequence as the recheck above (something could have consumed
+        # the armed Single during the longer window), so it reuses the same
+        # halt reason rather than inventing a new one for what is the same
+        # underlying condition detected later.
+        if not self._poll_scope_armed():
+            self._open_mains_with_cooldown(context, include_cooldown=False)
+            raise _SequencerHalt(
+                terminal=Terminal.RIG_FAULT,
+                category=FaultCategory.RIG,
+                reason="scope_lost_armed_before_injection",
+            )
+        self._record_diagnostic_stage(context, "armed_observation_3")
+
+        # Same intent as the armed rechecks above, via a second, independent
         # signal: a trigger event latched between arm_single and here means
         # something fired before the deliberate K3 close, so any resulting
         # waveform would not correspond to the intended K3-close transient.
+        # This remains the check immediately before K3 close.
         pre_injection_ter = self._scope.read_trigger_event_register()
         self._record_diagnostic_stage(
             context, "pre_injection_ter_read", trigger_event_register=pre_injection_ter
