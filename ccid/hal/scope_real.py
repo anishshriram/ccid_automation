@@ -478,8 +478,11 @@ class ScopeReal(ScopeInterface):
         return False
 
     def _run_bit_set(self) -> bool:
-        condition = int(float(self._query(":OPERegister:CONDition?")))
-        return bool(condition & (1 << 3))
+        return bool(self.read_operation_condition() & (1 << 3))
+
+    def read_operation_condition(self) -> int:
+        self._require_connected()
+        return int(float(self._query(":OPERegister:CONDition?")))
 
     def _require_connected(self) -> None:
         if self._connection_unusable:

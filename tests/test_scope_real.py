@@ -256,6 +256,34 @@ class ScopeRealTests(unittest.TestCase):
         self.assertFalse(scope.read_trigger_event_register())
         self.assertIn(":TER?", rm.inst.queries)
 
+    def test_read_operation_condition_returns_raw_value(self) -> None:
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [40]
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        self.assertEqual(scope.read_operation_condition(), 40)
+        self.assertIn(":OPERegister:CONDition?", rm.inst.queries)
+
+    def test_read_operation_condition_is_side_effect_free_across_repeats(self) -> None:
+        # Unlike :TER?, repeated reads must keep returning the same value
+        # rather than clearing/consuming anything.
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = []  # fake returns "0" once exhausted, every time
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        self.assertEqual(scope.read_operation_condition(), 0)
+        self.assertEqual(scope.read_operation_condition(), 0)
+
     def test_read_trigger_event_register_true_when_latched(self) -> None:
         rm = _FakeRM()
         rm.inst.ter_response = "+1"

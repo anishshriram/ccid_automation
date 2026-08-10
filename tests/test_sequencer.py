@@ -511,14 +511,74 @@ class SequencerTests(unittest.TestCase):
         self.assertTrue(forced_state_path.exists())
         forced_state = json.loads(forced_state_path.read_text(encoding="utf-8"))
         self.assertEqual(forced_state["capture_type"], "forced_diagnostic_non_measurement")
-        self.assertGreaterEqual(forced_state["elapsed_since_k3_closed_s"], 0.1)
+
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 13: separate Pi-side timestamps,
+        # not a single one assumed to map onto the waveform's own t=0.
+        timing = forced_state["pi_side_timing"]
+        self.assertIsNotNone(timing["force_command_start_monotonic_s"])
+        self.assertIsNotNone(timing["force_command_return_monotonic_s"])
+        self.assertIsNotNone(timing["forced_acquisition_completion_monotonic_s"])
+        self.assertLessEqual(timing["k3_closed_monotonic_s"], timing["force_command_start_monotonic_s"])
+        self.assertLessEqual(
+            timing["force_command_start_monotonic_s"], timing["force_command_return_monotonic_s"]
+        )
+        self.assertLessEqual(
+            timing["force_command_return_monotonic_s"],
+            timing["forced_acquisition_completion_monotonic_s"],
+        )
+        self.assertGreaterEqual(
+            timing["force_command_start_monotonic_s"] - timing["k3_closed_monotonic_s"], 0.1
+        )
+
+        # Per-stage timeline covers the whole cycle, in nondecreasing
+        # monotonic order, ending with the forced-trigger stages.
+        timeline = forced_state["diagnostic_timeline"]
+        stages = [entry["stage"] for entry in timeline]
+        self.assertEqual(
+            stages,
+            [
+                "configuration_completion",
+                "baseline_ter_clear_read",
+                "baseline_ter_verify_read",
+                "single_command_start",
+                "single_command_return",
+                "armed_observation_1",
+                "armed_observation_2",
+                "pre_injection_ter_read",
+                "k3_close",
+                "forced_diagnostic_ter_gate_read",
+                "force_command_start",
+                "force_command_return",
+                "acquisition_completion_observed",
+                "k3_open",
+            ],
+        )
+        timestamps = [entry["monotonic_s"] for entry in timeline]
+        self.assertEqual(timestamps, sorted(timestamps))
+        for entry in timeline:
+            self.assertIn("operation_condition", entry)
+            self.assertIn("hal_status", entry)
+
+        # Waveform analysis is computed purely from the waveform itself.
+        analysis = forced_state["waveform_analysis"]
+        self.assertIsNotNone(analysis)
+        self.assertIn("min_v", analysis)
+        self.assertIn("max_v", analysis)
+        self.assertIn("rms_v", analysis)
+        self.assertIn("sustained_onset_s", analysis)
+        self.assertIn("collapse_s", analysis)
+        self.assertIn("burst_duration_s", analysis)
+        self.assertNotIn("verdict", analysis)
+        self.assertNotIn("trip_time_s", analysis)
 
         scope_state = json.loads((diag_dir / "scope_state.json").read_text(encoding="utf-8"))
         self.assertEqual(scope_state["k3_open_reason"], "backstop")
 
-        # Never a measurement: no normal per-cycle artifact exists.
+        # Never a measurement: no normal per-cycle artifact exists, and the
+        # cycle's own analysis/verdict path never saw this waveform.
         self.assertFalse((run_dir / "waveforms" / "1.npz").exists())
         self.assertFalse((run_dir / "images" / "1_scope.png").exists())
+        self.assertIsNone(result.cycles[0].verdict)
 
     def test_forced_diagnostic_capture_skipped_when_trigger_event_already_confirmed(self) -> None:
         # A real trigger event by the ~100 ms checkpoint means forcing is

@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from ccid.hal.base import ScopeTimeoutDiagnostics
+from ccid.hal.base import ScopeTimeoutDiagnostics, WaveformCapture
 from ccid.recorder import CycleArtifacts, CycleCsvRow, RunRecorder
 
 
@@ -171,6 +171,76 @@ class RecorderTests(unittest.TestCase):
 
         errors_text = (self.run_dir / "diagnostics" / "1" / "scope_errors.txt").read_text(encoding="utf-8")
         self.assertEqual(errors_text, "no errors\n")
+
+    @staticmethod
+    def _forced_capture() -> WaveformCapture:
+        return WaveformCapture(
+            samples=b"\x01\x02\x03\x04",
+            preamble={"x_increment": 1e-7, "points": 4},
+            settings_readback={"waveform_points_mode": "RAW"},
+            scope_png=b"\x89PNG\r\n\x1a\nforced",
+            captured_at_utc=datetime(2026, 8, 10, tzinfo=timezone.utc),
+        )
+
+    def test_write_forced_diagnostic_capture_writes_expected_files(self) -> None:
+        self.recorder.write_forced_diagnostic_capture(
+            run_dir=self.run_dir,
+            run_id="20260803_135500",
+            cycle_index=1,
+            capture=self._forced_capture(),
+            force_command_start_monotonic_s=100.10,
+            force_command_return_monotonic_s=100.101,
+            forced_acquisition_completion_monotonic_s=100.102,
+            k3_closed_monotonic_s=100.0,
+            diagnostic_timeline=[
+                {"stage": "k3_close", "monotonic_s": 100.0, "operation_condition": 40,
+                 "trigger_event_register": None, "hal_status": "ARMED"},
+                {"stage": "force_command_start", "monotonic_s": 100.10, "operation_condition": 40,
+                 "trigger_event_register": None, "hal_status": "ACQUIRING"},
+            ],
+            waveform_analysis={"min_v": -167.0, "max_v": 141.0, "rms_v": 80.0},
+        )
+
+        diag_dir = self.run_dir / "diagnostics" / "1"
+        self.assertTrue((diag_dir / "forced_diagnostic_waveform.npz").exists())
+        self.assertEqual((diag_dir / "forced_diagnostic_scope.png").read_bytes(), b"\x89PNG\r\n\x1a\nforced")
+
+        state = json.loads((diag_dir / "forced_diagnostic_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["capture_type"], "forced_diagnostic_non_measurement")
+        timing = state["pi_side_timing"]
+        self.assertEqual(timing["force_command_start_monotonic_s"], 100.10)
+        self.assertEqual(timing["force_command_return_monotonic_s"], 100.101)
+        self.assertEqual(timing["forced_acquisition_completion_monotonic_s"], 100.102)
+        self.assertEqual(timing["k3_closed_monotonic_s"], 100.0)
+        self.assertEqual(len(state["diagnostic_timeline"]), 2)
+        self.assertEqual(state["diagnostic_timeline"][0]["stage"], "k3_close")
+        self.assertEqual(state["waveform_analysis"]["min_v"], -167.0)
+        # The old single-timestamp fields this replaces must be gone, not
+        # just unused - their presence is exactly what enabled the wrong
+        # conclusion in SCOPE_TRIGGER_DEBUG_LOG.md Entry 13.
+        self.assertNotIn("forced_at_monotonic_s", state)
+        self.assertNotIn("elapsed_since_k3_closed_s", state)
+
+    def test_write_forced_diagnostic_capture_does_not_touch_normal_artifacts_or_runstate(self) -> None:
+        runstate_before = (self.run_dir / "runstate.json").read_bytes()
+
+        self.recorder.write_forced_diagnostic_capture(
+            run_dir=self.run_dir,
+            run_id="20260803_135500",
+            cycle_index=1,
+            capture=self._forced_capture(),
+            force_command_start_monotonic_s=100.10,
+            force_command_return_monotonic_s=100.101,
+            forced_acquisition_completion_monotonic_s=None,
+            k3_closed_monotonic_s=100.0,
+            diagnostic_timeline=[],
+            waveform_analysis=None,
+        )
+
+        self.assertEqual((self.run_dir / "runstate.json").read_bytes(), runstate_before)
+        self.assertFalse((self.run_dir / "waveforms" / "1.npz").exists())
+        self.assertFalse((self.run_dir / "images" / "1_scope.png").exists())
+        self.assertFalse((self.run_dir / "cycles" / "1.json").exists())
 
 
 if __name__ == "__main__":

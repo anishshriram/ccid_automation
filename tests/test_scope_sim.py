@@ -46,6 +46,36 @@ class ScopeSimTests(unittest.TestCase):
         self.assertFalse(scope.wait_until_acquisition_complete(timeout_s=5.0, now_monotonic_s=self.clock.now()))
         self.assertEqual(scope.status(), ScopeStatus.ARMED)
 
+    def test_read_operation_condition_reflects_status(self) -> None:
+        scope = ScopeSim(monotonic_now=self.clock.now)
+        scope.connect()
+        self.assertEqual(scope.read_operation_condition(), 0)
+        scope.configure_for_cycle(ScopeSettings())
+        scope.arm_single()
+        scope.wait_until_armed(timeout_s=2.0, now_monotonic_s=self.clock.now())
+        self.assertNotEqual(scope.read_operation_condition(), 0)
+        scope.wait_until_acquisition_complete(timeout_s=1.0, now_monotonic_s=self.clock.now())
+        self.assertEqual(scope.read_operation_condition(), 0)
+
+    def test_force_trigger_reflects_immediately_in_operation_condition(self) -> None:
+        # Real :TRIGger:FORCe is synchronous - operation_condition must
+        # show "not running" right after force_trigger() returns, without
+        # requiring a subsequent wait_until_acquisition_complete() call
+        # (Entry 11 deliberately avoids calling that after forcing).
+        scope = ScopeSim(
+            scenario=ScopeSimScenario(never_triggered=True),
+            monotonic_now=self.clock.now,
+        )
+        scope.connect()
+        scope.configure_for_cycle(ScopeSettings())
+        scope.arm_single()
+        scope.wait_until_armed(timeout_s=2.0, now_monotonic_s=self.clock.now())
+        self.assertNotEqual(scope.read_operation_condition(), 0)
+
+        scope.force_trigger()
+
+        self.assertEqual(scope.read_operation_condition(), 0)
+
     def test_force_trigger_completes_a_never_triggered_acquisition(self) -> None:
         scope = ScopeSim(
             scenario=ScopeSimScenario(never_triggered=True),

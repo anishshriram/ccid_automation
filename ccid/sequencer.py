@@ -42,6 +42,7 @@ from ccid.classify import (
     gate_timeout_action,
 )
 from ccid.config import AppConfig
+from ccid.forced_diagnostic_analysis import analyze_forced_diagnostic_waveform
 from ccid.errors import CcidError, PersistenceError
 from ccid.hal.base import (
     ChargingGateToken,
@@ -137,7 +138,18 @@ class _CycleContext:
     # diagnostics bundle's own :TER? query) would otherwise see a
     # since-cleared 0 and lose the evidence.
     live_trigger_event_seen: bool = False
-    forced_diagnostic_triggered_at_monotonic_s: float | None = None
+    # Entry 13: split from the single forced_at_monotonic_s timestamp that
+    # was previously (wrongly) assumed to correspond to the scope's own
+    # waveform t=0 - it is a Pi-side monotonic instant, not a scope
+    # timebase reference, and must never be mapped onto waveform samples.
+    force_command_start_monotonic_s: float | None = None
+    force_command_return_monotonic_s: float | None = None
+    forced_acquisition_completion_monotonic_s: float | None = None
+    # Best-effort, read-only per-stage snapshots (monotonic_s,
+    # operation_condition, trigger_event_register, hal_status) recorded
+    # throughout the cycle - see Sequencer._record_diagnostic_stage. Purely
+    # descriptive; never influences cycle behavior.
+    diagnostic_timeline: list[dict[str, object]] = field(default_factory=list)
 
 
 class Sequencer:
@@ -425,6 +437,7 @@ class Sequencer:
 
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.SCOPE_CONFIGURING)
         self._scope.configure_for_cycle(self._scope_settings)
+        self._record_diagnostic_stage(context, "configuration_completion")
 
         # :TER? is a read-and-clear event register (confirmed in the
         # Keysight manual, Entry 11): a single nonzero read here cannot
@@ -435,8 +448,15 @@ class Sequencer:
         # *verification* read is still nonzero (SCOPE_TRIGGER_DEBUG_LOG.md
         # Entry 12: a real forced-diagnostic run halted here on what turned
         # out to be ordinary stale residue from a single-read check).
-        self._scope.read_trigger_event_register()
-        if self._scope.read_trigger_event_register():
+        baseline_clear_ter = self._scope.read_trigger_event_register()
+        self._record_diagnostic_stage(
+            context, "baseline_ter_clear_read", trigger_event_register=baseline_clear_ter
+        )
+        baseline_verify_ter = self._scope.read_trigger_event_register()
+        self._record_diagnostic_stage(
+            context, "baseline_ter_verify_read", trigger_event_register=baseline_verify_ter
+        )
+        if baseline_verify_ter:
             self._open_mains_with_cooldown(context, include_cooldown=False)
             raise _SequencerHalt(
                 terminal=Terminal.RIG_FAULT,
@@ -445,7 +465,9 @@ class Sequencer:
             )
 
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.SCOPE_ARMING)
+        self._record_diagnostic_stage(context, "single_command_start")
         self._scope.arm_single()
+        self._record_diagnostic_stage(context, "single_command_return")
 
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.SCOPE_ARMED)
         if not self._poll_scope_armed():
@@ -455,6 +477,7 @@ class Sequencer:
                 category=FaultCategory.RIG,
                 reason="scope_not_armed_timeout",
             )
+        self._record_diagnostic_stage(context, "armed_observation_1")
 
         # Allow the fresh Single acquisition to settle, then confirm that an
         # unrelated transient has not consumed it before K3 can close.
@@ -470,12 +493,17 @@ class Sequencer:
                 category=FaultCategory.RIG,
                 reason="scope_lost_armed_before_injection",
             )
+        self._record_diagnostic_stage(context, "armed_observation_2")
 
         # Same intent as the armed recheck above, via a second, independent
         # signal: a trigger event latched between arm_single and here means
         # something fired before the deliberate K3 close, so any resulting
         # waveform would not correspond to the intended K3-close transient.
-        if self._scope.read_trigger_event_register():
+        pre_injection_ter = self._scope.read_trigger_event_register()
+        self._record_diagnostic_stage(
+            context, "pre_injection_ter_read", trigger_event_register=pre_injection_ter
+        )
+        if pre_injection_ter:
             self._open_mains_with_cooldown(context, include_cooldown=False)
             raise _SequencerHalt(
                 terminal=Terminal.RIG_FAULT,
@@ -488,6 +516,7 @@ class Sequencer:
         self._contactors.close_k3(gate_token)
         k3_closed_s = self._now()
         context.k3_closed_monotonic_s = k3_closed_s
+        self._record_diagnostic_stage(context, "k3_close")
         self._assert_no_mains_mismatch()
 
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.ACQUIRING)
@@ -499,7 +528,7 @@ class Sequencer:
             # SCOPE_TRIGGER_DEBUG_LOG.md Entry 3 for the incident that
             # required this ordering.
             self._open_mains_with_cooldown(context, include_cooldown=False)
-            if context.forced_diagnostic_triggered_at_monotonic_s is not None:
+            if context.force_command_return_monotonic_s is not None:
                 self._capture_forced_diagnostic_best_effort(context, run_dir=run_dir, run_id=run_id)
             reason = self._capture_timeout_diagnostics_best_effort(
                 context, run_dir=run_dir, run_id=run_id
@@ -547,7 +576,7 @@ class Sequencer:
                 # transfer is deferred until after full safe-off so it can
                 # never delay the backstop check just below.
                 forced_diagnostic_attempted = True
-                self._issue_forced_diagnostic_trigger(context, now_s=now_s)
+                self._issue_forced_diagnostic_trigger(context)
             if not opened and now_s >= k3_deadline:
                 self._transition(
                     context.transitions,
@@ -558,6 +587,7 @@ class Sequencer:
                 self._contactors.open_k3()
                 context.k3_open_monotonic_s = self._now()
                 context.k3_open_reason = "backstop"
+                self._record_diagnostic_stage(context, "k3_open")
                 opened = True
             if forced_diagnostic_attempted:
                 # A forced trigger consumes the same single-shot
@@ -569,6 +599,22 @@ class Sequencer:
                 # Entry 11). It still only returns via the backstop/timeout
                 # paths below, exactly as an unforced no-trigger cycle
                 # already does.
+                #
+                # Diagnostic-only: watch (via the loop's existing ~10 ms
+                # cadence, no extra polling loop) for the run bit clearing
+                # after a successful force, purely to record when it
+                # happened - never to decide "acquired." See Entry 13.
+                if (
+                    context.force_command_return_monotonic_s is not None
+                    and context.forced_acquisition_completion_monotonic_s is None
+                ):
+                    try:
+                        condition = self._scope.read_operation_condition()
+                    except Exception:
+                        condition = None
+                    if condition is not None and not (condition & (1 << 3)):
+                        context.forced_acquisition_completion_monotonic_s = self._now()
+                        self._record_diagnostic_stage(context, "acquisition_completion_observed")
                 self._sleep(0.01)
                 continue
             if self._scope.wait_until_acquisition_complete(
@@ -585,6 +631,7 @@ class Sequencer:
                     self._contactors.open_k3()
                     context.k3_open_monotonic_s = self._now()
                     context.k3_open_reason = "normal"
+                    self._record_diagnostic_stage(context, "k3_open")
                 return True
             self._sleep(0.01)
         if not opened:
@@ -597,9 +644,10 @@ class Sequencer:
             self._contactors.open_k3()
             context.k3_open_monotonic_s = self._now()
             context.k3_open_reason = "acquisition_timeout"
+            self._record_diagnostic_stage(context, "k3_open")
         return False
 
-    def _issue_forced_diagnostic_trigger(self, context: _CycleContext, *, now_s: float) -> None:
+    def _issue_forced_diagnostic_trigger(self, context: _CycleContext) -> None:
         # Only the fast, bounded live-window operations happen here: one
         # :TER? read and one fire-and-forget :TRIGger:FORCe write, both the
         # same class of call already trusted elsewhere in this loop (e.g.
@@ -610,13 +658,7 @@ class Sequencer:
         # safe-off, so it can never delay the 300 ms K3 backstop check this
         # method runs alongside.
         try:
-            if self._scope.read_trigger_event_register():
-                # A real trigger occurred - forcing is neither needed nor
-                # appropriate. Latched locally because this read just
-                # cleared TER, so it's the only remaining record for Entry
-                # 10's post-timeout reclassification.
-                context.live_trigger_event_seen = True
-                return
+            gate_ter = self._scope.read_trigger_event_register()
         except Exception as exc:
             self._logger.warning(
                 "cycle=%d forced-diagnostic TER pre-check failed, skipping force: %s",
@@ -624,6 +666,18 @@ class Sequencer:
                 exc,
             )
             return
+        self._record_diagnostic_stage(
+            context, "forced_diagnostic_ter_gate_read", trigger_event_register=gate_ter
+        )
+        if gate_ter:
+            # A real trigger occurred - forcing is neither needed nor
+            # appropriate. Latched locally because this read just cleared
+            # TER, so it's the only remaining record for Entry 10's
+            # post-timeout reclassification.
+            context.live_trigger_event_seen = True
+            return
+        context.force_command_start_monotonic_s = self._now()
+        self._record_diagnostic_stage(context, "force_command_start")
         try:
             self._scope.force_trigger()
         except Exception as exc:
@@ -631,7 +685,8 @@ class Sequencer:
                 "cycle=%d force_trigger() failed: %s", context.cycle_index, exc
             )
             return
-        context.forced_diagnostic_triggered_at_monotonic_s = now_s
+        context.force_command_return_monotonic_s = self._now()
+        self._record_diagnostic_stage(context, "force_command_return")
 
     def _capture_forced_diagnostic_best_effort(self, context: _CycleContext, *, run_dir, run_id: str) -> None:
         # Same best-effort contract as _capture_timeout_diagnostics_best_effort:
@@ -651,14 +706,33 @@ class Sequencer:
                 "cycle=%d forced-diagnostic capture failed: %s", context.cycle_index, exc
             )
             return
+        # Diagnostic-only burst identification, computed entirely from the
+        # waveform's own samples/preamble - never from a Pi-side timestamp
+        # (SCOPE_TRIGGER_DEBUG_LOG.md Entry 13). A failure here must not
+        # prevent the raw waveform itself from still being written.
+        waveform_analysis: Mapping[str, object] | None
+        try:
+            blob = _pack_waveform_blob(capture.samples, dict(capture.preamble))
+            waveform_analysis = analyze_forced_diagnostic_waveform(blob).to_dict()
+        except Exception as exc:
+            self._logger.warning(
+                "cycle=%d forced-diagnostic waveform analysis failed: %s", context.cycle_index, exc
+            )
+            waveform_analysis = None
         try:
             self._recorder.write_forced_diagnostic_capture(
                 run_dir=run_dir,
                 run_id=run_id,
                 cycle_index=context.cycle_index,
                 capture=capture,
-                forced_at_monotonic_s=context.forced_diagnostic_triggered_at_monotonic_s,
+                force_command_start_monotonic_s=context.force_command_start_monotonic_s,
+                force_command_return_monotonic_s=context.force_command_return_monotonic_s,
+                forced_acquisition_completion_monotonic_s=(
+                    context.forced_acquisition_completion_monotonic_s
+                ),
                 k3_closed_monotonic_s=context.k3_closed_monotonic_s,
+                diagnostic_timeline=context.diagnostic_timeline,
+                waveform_analysis=waveform_analysis,
             )
         except Exception as exc:
             self._logger.warning(
@@ -931,6 +1005,42 @@ class Sequencer:
             state.value,
             entry.at_monotonic_s,
             detail,
+        )
+
+    def _record_diagnostic_stage(
+        self,
+        context: _CycleContext,
+        stage: str,
+        *,
+        trigger_event_register: bool | None = None,
+    ) -> None:
+        # Best-effort, read-only, purely descriptive - see
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 13. Must never raise into the
+        # caller or influence cycle behavior; a failed operation_condition
+        # read is recorded as None rather than aborting the snapshot.
+        # trigger_event_register is only ever passed in from a checkpoint
+        # that already legitimately read :TER? elsewhere (the baseline
+        # clear/verify reads, the pre-injection read, the forced-diagnostic
+        # gate read) - this method never issues its own :TER? query, since
+        # every read consumes/clears that register and an extra read here
+        # would corrupt the evidence the real checkpoints depend on.
+        now_s = self._now()
+        try:
+            operation_condition: int | None = self._scope.read_operation_condition()
+        except Exception:
+            operation_condition = None
+        try:
+            hal_status = self._scope.status().value
+        except Exception:
+            hal_status = None
+        context.diagnostic_timeline.append(
+            {
+                "stage": stage,
+                "monotonic_s": now_s,
+                "operation_condition": operation_condition,
+                "trigger_event_register": trigger_event_register,
+                "hal_status": hal_status,
+            }
         )
 
 

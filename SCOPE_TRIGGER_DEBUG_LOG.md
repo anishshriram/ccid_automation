@@ -10,59 +10,40 @@ up to date rather than buried at the bottom.
 
 ## Current status (as of 2026-08-10)
 
-**Not solved, but narrowed to a genuine no-trigger condition - do not touch
-normal trigger settings again.** Entry 9's config-error-blocking fix has
-been **confirmed clean on real hardware** (operator-verified `configure
---real` check: no rejected commands, no exception). Entry 10's TER
-instrumentation has now also run on a real energized cycle: `TER = 0`,
-`operation_condition = 40`, `hal_status = ACQUIRING` for the full 306.6 ms
-K3-closed window. Unlike the Entry 8 reading that motivated Entry 10 (`TER =
-+1`, prompting the "triggered but stuck" hypothesis), this run's TER stayed
-0 throughout - a **proven, confirmed genuine no-trigger condition**, not a
-triggered-but-uncompleted one. Per operator instruction: trigger mode,
-coupling, edge source/slope/level, and probe ratio (Entries 1, 7, 8) have
-now all been checked and correctly configured multiple times without
-resolving the halt - **do not modify normal trigger settings again** without
-new evidence specifically implicating one.
+**Best evidence yet, likely the leakage waveform itself - do not touch
+normal trigger settings.** Entry 12's baseline-check fix let a real
+forced-diagnostic run reach K3 close and force successfully. The forced
+capture shows a large bipolar burst, roughly -167 V to +141 V - since the
+measured node should be inactive until K3 closes, this is the **likely
+leakage waveform**, captured for the first time. Per operator instruction,
+normal trigger settings (mode, coupling, edge source/slope/level, probe
+ratio - Entries 1, 7, 8) have been checked repeatedly and are not to be
+touched again without new evidence specifically implicating one.
 
-Entry 11 added a diagnostic-only forced capture: if TER is still 0
-~100 ms after K3 closes, `:TRIGger:FORCe` (confirmed via the official
-Keysight InfiniiVision 2000 X-Series Programmer's Guide - this exact model
-family, write-only, no query form, equivalent to the front-panel [Force
-Trigger] key) forces the pending single-shot acquisition to complete so the
-resulting waveform shows what the analog front end actually looked like
-partway through the closed window. Data is written only under
-`diagnostics/<cycle>/`, explicitly labeled
-`"capture_type": "forced_diagnostic_non_measurement"`, and never reaches
-`analyze_waveform`, PASS/FAIL, or trip-time calculation.
+**A follow-on conclusion was wrong, and Entry 13 corrects the tooling that
+produced it, not just the conclusion.** An early read of the diagnostics
+placed the burst "86 ms before K3" by treating `forced_at_monotonic_s` (a
+Pi-side monotonic timestamp) as if it corresponded to the scope waveform's
+own t=0. Nothing in this system synchronizes those two clocks, so that
+mapping was unsupported. Entry 13:
+- Records separate Pi-side monotonic timestamps (force-command start,
+  force-command return, observed acquisition completion) plus a full
+  per-stage timeline (configuration completion, both TER baseline reads,
+  Single command start/return, both armed observations, the pre-injection
+  TER read, K3 close, the forced-diagnostic TER gate read, K3 open) - each
+  stage records `operation_condition`, `hal_status`, and (only where a real
+  `:TER?` read already happens) the TER value - instead of one timestamp.
+- Adds `ccid/forced_diagnostic_analysis.py`, computed **entirely from the
+  waveform's own samples and scope-supplied preamble time base** - never
+  from a Pi-side timestamp: quiet baseline, sustained onset, min/max, RMS,
+  ±20 V threshold crossings, collapse, and burst duration.
+- Neither replaces nor touches `analyze_waveform`/`Verdict`/PASS-FAIL -
+  both new datasets are diagnostic-only, written under `diagnostics/` only.
+- The 300 ms K3 backstop, safe-off-before-transfer ordering, and the
+  forced-diagnostic gate/timing are all unchanged.
 
-**Entry 11's real dry run found a bug in Entry 10's baseline check, not in
-the forced-diagnostic feature itself:** the cycle halted with
-`scope_stale_trigger_event_before_arm` before ever reaching arm. Since
-`:TER?` is read-and-clear (confirmed in the manual, Entry 11), a *single*
-nonzero baseline read can never distinguish genuinely stale residue left
-over from a prior cycle/session (harmless once cleared) from an actively
-faulty condition - the single-read check could not tell them apart and
-halted on what was very likely ordinary residue. Entry 12 fixes this: the
-baseline check now reads twice (clear, then verify) and only halts if the
-*verification* read is still nonzero. The pre-injection TER check
-(immediately before K3 close) is intentionally unchanged - a single read
-there is still correct, since it should already be starting from the clean
-baseline this fix now actually establishes. **Untested against real
-hardware** - the next energized cycle is the first real test of both this
-fix and whether the forced capture (unaffected by this fix) shows anything
-useful once the cycle actually reaches arm/K3 close.
-
-Also still unconfirmed independently on this unit (though now strongly
-supported by the official manual, which explicitly states `:TER?` is
-read-and-clear): whether that documented behavior is what this specific
-MSO-X 2014A actually does - the project's own experience with
-`:TRIGger:NREJect` (documented, but confirmed unsupported on this unit in
-Entry 9) is a standing reason not to fully equate "documented" with
-"confirmed on this hardware." Per operator instruction, normal trigger
-settings (mode, coupling, edge source/slope/level, probe ratio - Entries 1,
-7, 8) are not to be touched again without new evidence specifically
-implicating one.
+**Untested against real hardware** - the next energized cycle is the first
+real test of the corrected metadata and the waveform-native burst analysis.
 
 Entry 7's probe-ratio-ordering fix was tried on a real
 energized cycle (Entry 8) and did **not** fix it - channel/trigger-edge
@@ -610,6 +591,130 @@ New tests: `test_trigger_event_register_stuck_does_not_self_clear`
 `test_scope_stuck_trigger_event_before_arm_row` (renamed),
 `test_scope_stale_trigger_event_before_arm_is_cleared_row`
 (`test_faultmatrix.py`). Full suite: 331 tests, OK, same 2 intentional
+skips.
+
+---
+
+## Entry 13 - 2026-08-10 - Likely leakage waveform captured; fixed a wrong Pi-timestamp-to-waveform-t=0 conclusion
+
+**What was tried:** With Entry 12's baseline-check fix, a real
+forced-diagnostic run reached K3 close and forced successfully. The forced
+capture shows a large bipolar burst, approximately -167 V to +141 V. Since
+the measured node should be inactive until K3 closes, this is treated as
+the likely leakage waveform - the most direct evidence yet in this
+investigation. A follow-on attempt to place that burst "86 ms before K3"
+assumed `forced_at_monotonic_s` (the Pi-side monotonic instant
+`force_trigger()` was called) corresponds to the scope waveform's own
+t=0. Nothing in this system ties those two clocks together - the scope's
+preamble time base (`x_increment`/`x_origin`) is entirely internal to the
+scope, and the Pi's `time.monotonic()` has no defined relationship to it.
+That conclusion was unsupported, and had to be retracted.
+
+**What this tells us:** the fix needed is in the tooling, not just the one
+conclusion - as long as the forced-diagnostic metadata offered only a
+single Pi-side timestamp next to a waveform, it invited exactly this
+mistake. The right fix is twofold: (1) give the Pi-side timeline enough
+resolution and stage coverage that reasoning about the *sequence and
+duration* of what the Pi commanded is still useful without needing to touch
+the waveform's time axis, and (2) derive any claim about *where in the
+waveform* the burst is entirely from the waveform's own samples and
+preamble - never from a Pi timestamp.
+
+**Implementation:**
+
+1. **Per-stage Pi-side timeline** (`ccid/sequencer.py`): a new
+   `Sequencer._record_diagnostic_stage()` helper appends
+   `{stage, monotonic_s, operation_condition, trigger_event_register,
+   hal_status}` to `context.diagnostic_timeline` at 14 points across the
+   cycle: `configuration_completion`, `baseline_ter_clear_read`,
+   `baseline_ter_verify_read`, `single_command_start`,
+   `single_command_return`, `armed_observation_1`, `armed_observation_2`,
+   `pre_injection_ter_read`, `k3_close`, `forced_diagnostic_ter_gate_read`,
+   `force_command_start`, `force_command_return`,
+   `acquisition_completion_observed`, `k3_open`. `operation_condition` is a
+   new live query (`ScopeInterface.read_operation_condition()`,
+   `:OPERegister:CONDition?`) added specifically because - unlike `:TER?` -
+   it is a *condition* register, not an *event* register: reading it has no
+   side effect, so it can be sampled at every stage without disturbing
+   anything (Entry 10/12's TER checkpoints, by contrast, are not resampled
+   here - each stage only records a TER value where a checkpoint that
+   already legitimately reads `:TER?` naturally occurs, since every read
+   consumes/clears that register and an extra read anywhere else would
+   corrupt the evidence those checkpoints depend on).
+2. **Split, precise force-command timestamps**: `forced_diagnostic_triggered_at_monotonic_s`
+   (one timestamp, reused from the outer polling loop's cached `now_s`) is
+   replaced by `force_command_start_monotonic_s` and
+   `force_command_return_monotonic_s`, each taken fresh at the precise
+   moment, plus `forced_acquisition_completion_monotonic_s`: after a
+   successful force, the existing ~10 ms poll loop cadence (already
+   running for the backstop) also watches, on each tick, for
+   `operation_condition`'s run bit to clear, and records the timestamp the
+   *first* time it does - diagnostic-only, still never used to decide
+   "acquired" (Entry 11's separation is unchanged). A real ScopeSim gap
+   surfaced here: `force_trigger()` only set an internal flag and left
+   `status()`/`read_operation_condition()` unchanged until a later
+   `wait_until_acquisition_complete()` call updated them - but Entry 11
+   deliberately stopped calling that after forcing, so the simulated
+   "acquisition complete" transition would never have been observed. Fixed
+   by making `ScopeSim.force_trigger()` update `self._status` immediately,
+   matching the real `:TRIGger:FORCe`'s synchronous behavior.
+3. **`ccid/forced_diagnostic_analysis.py`** (new module):
+   `analyze_forced_diagnostic_waveform()` identifies the burst using only
+   the waveform's own samples and preamble (via `ccid.analysis.load_waveform`,
+   `rms` - reused because they are pure numeric primitives, not
+   verdict-producing): min/max, RMS, a sustained-onset detector (first
+   point where `|sample| >= 20 V` for a minimum duration, not a single
+   noisy sample), a quiet-baseline RMS/duration for everything before that
+   onset, a collapse detector (first sustained return below 5 V after
+   onset), burst duration (collapse - onset), and separate positive
+   (`>= +20 V`) / negative (`<= -20 V`) threshold-crossing counts and first
+   times. Deliberately does **not** import `AnalysisConfig`,
+   `analyze_waveform`, or any `check_*`/verdict function from
+   `ccid.analysis` - there is no code path by which this module's output
+   can reach a `Verdict`, `cycles.csv`, or PASS/FAIL.
+4. **Recorder** (`ccid/recorder.py`): `write_forced_diagnostic_capture()`'s
+   signature changed - `forced_at_monotonic_s`/`elapsed_since_k3_closed_s`
+   are gone entirely (not just superseded, since their presence is exactly
+   what enabled the wrong conclusion), replaced by a `pi_side_timing`
+   sub-object (the three new timestamps plus `k3_closed_monotonic_s`), the
+   full `diagnostic_timeline`, and `waveform_analysis` (the new module's
+   output, or `None` if that analysis itself failed - a failure there must
+   not prevent the raw waveform from still being written). The persisted
+   note field now explicitly warns against mapping the `*_monotonic_s`
+   fields onto the waveform's time axis.
+5. **Safety properties preserved, unchanged**: the 300 ms K3 backstop's
+   deadline/logic, safe-off-before-transfer ordering (diagnostics still run
+   only after `_open_mains_with_cooldown`), the forced-diagnostic gate/
+   timing (~100 ms, TER-gated, fast-phase-only), and Entry 11's
+   never-treat-a-forced-completion-as-real-success rule are all untouched.
+   No trigger-condition settings were touched.
+
+**Commit:** (pending)
+
+**Result:** Not yet tried against real hardware.
+
+**What this tells us:** Nothing further about root cause yet by itself -
+same as Entries 2, 10, and 11, this is instrumentation and tooling
+correction, not a new hypothesis. Its value is in what the *next* real
+forced capture's `waveform_analysis` says about the burst directly (onset
+time, duration, amplitude relative to the ±20 V trigger level) without
+requiring any assumption about Pi/scope clock correspondence, and in
+whether the fuller per-stage timeline surfaces anything unexpected in the
+Pi-side sequencing itself.
+
+New tests: `test_read_operation_condition_returns_raw_value`,
+`test_read_operation_condition_is_side_effect_free_across_repeats`
+(`test_scope_real.py`); `test_read_operation_condition_reflects_status`,
+`test_force_trigger_reflects_immediately_in_operation_condition`
+(`test_scope_sim.py`); `test_write_forced_diagnostic_capture_writes_expected_files`,
+`test_write_forced_diagnostic_capture_does_not_touch_normal_artifacts_or_runstate`
+(`test_recorder.py`); `test_identifies_burst_quiet_baseline_onset_and_collapse`,
+`test_quiet_record_reports_no_onset_or_collapse`,
+`test_never_used_for_pass_fail` (new `test_forced_diagnostic_analysis.py`);
+expanded assertions (timestamp ordering, full stage-timeline coverage,
+`waveform_analysis` presence) in
+`test_forced_diagnostic_capture_when_ter_still_zero`
+(`test_sequencer.py`). Full suite: 340 tests, OK, same 2 intentional
 skips.
 
 ---

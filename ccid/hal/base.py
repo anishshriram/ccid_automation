@@ -255,6 +255,17 @@ class ScopeInterface(ABC):
         pass
 
     @abstractmethod
+    def read_operation_condition(self) -> int:
+        """Query `:OPERegister:CONDition?` and return the raw integer value.
+
+        Unlike `read_trigger_event_register`, this is a condition register,
+        not an event register - reading it has no side effect and does not
+        consume/clear anything, so it is safe to call at arbitrary
+        diagnostic checkpoints without disturbing other state (see
+        SCOPE_TRIGGER_DEBUG_LOG.md Entry 13)."""
+        pass
+
+    @abstractmethod
     def force_trigger(self) -> None:
         """Sends `:TRIGger:FORCe` - the documented remote equivalent of the
         front-panel [Force Trigger] key (confirmed against the Keysight

@@ -179,10 +179,27 @@ class ScopeSim(ScopeInterface):
         self._trigger_event_latched = False
         return latched
 
+    def read_operation_condition(self) -> int:
+        self._require_connected()
+        self._maybe_raise("operation_condition")
+        # A condition register, not an event register - safe to read
+        # repeatedly with no side effect. Mirrors the real "40" (run bit +
+        # another bit) observed while armed/acquiring (Entry 8) and 0
+        # otherwise; this sim value is descriptive only, nothing internal
+        # is derived from it.
+        running = self._status in (ScopeStatus.ARMING, ScopeStatus.ARMED, ScopeStatus.ACQUIRING)
+        return 40 if running else 0
+
     def force_trigger(self) -> None:
         self._require_connected()
         self._maybe_raise("force_trigger")
         self._force_triggered = True
+        # Real :TRIGger:FORCe is synchronous - the acquisition completes as
+        # part of issuing the command, not later when something happens to
+        # poll for it. status()/read_operation_condition() must reflect
+        # that immediately, since callers may (correctly, per Entry 11) no
+        # longer call wait_until_acquisition_complete() after forcing.
+        self._status = ScopeStatus.COMPLETE
 
     def capture_after_acquire(self) -> WaveformCapture:
         self._require_connected()

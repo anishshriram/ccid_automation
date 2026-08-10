@@ -31,7 +31,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 import zipfile
 
 from ccid import __version__
@@ -311,12 +311,28 @@ class RunRecorder:
         run_id: str,
         cycle_index: int,
         capture: WaveformCapture,
-        forced_at_monotonic_s: float,
+        force_command_start_monotonic_s: float | None,
+        force_command_return_monotonic_s: float | None,
+        forced_acquisition_completion_monotonic_s: float | None,
         k3_closed_monotonic_s: float | None,
+        diagnostic_timeline: Sequence[Mapping[str, object]],
+        waveform_analysis: Mapping[str, object] | None,
     ) -> None:
         """Best-effort evidence capture for a diagnostic-only forced
         trigger (SCOPE_TRIGGER_DEBUG_LOG.md Entry 11) - a real trigger
         never occurred this cycle, so this is not a measurement.
+
+        `diagnostic_timeline` and `waveform_analysis` intentionally replace
+        the single `forced_at_monotonic_s`/`elapsed_since_k3_closed_s`
+        fields from the original version of this method (Entry 13): that
+        single Pi-side timestamp was incorrectly assumed to correspond to
+        the scope waveform's own t=0, which nothing in this system
+        actually guarantees. The Pi-side `*_monotonic_s` fields below are
+        still recorded (useful for reasoning about the Pi-side sequence of
+        events and durations) but must never be mapped onto the waveform's
+        own time axis - `waveform_analysis` (from
+        `ccid.forced_diagnostic_analysis`) is computed entirely from the
+        waveform's own samples/preamble instead, for exactly that reason.
 
         Written only under diagnostics/<cycle_index>/, never
         waveforms/ or images/ - anything reading the normal per-cycle
@@ -340,19 +356,25 @@ class RunRecorder:
                 "cycle_index": cycle_index,
                 "capture_type": "forced_diagnostic_non_measurement",
                 "note": (
-                    "Forced via :TRIGger:FORCe because a real trigger had not "
-                    "occurred ~100 ms after K3 closed - not a real trigger "
-                    "event. Must never be used for PASS/FAIL or trip-time "
-                    "calculation."
+                    "Forced via :TRIGger:FORCe because TER was still 0 ~100 ms "
+                    "after K3 closed - not a real trigger event. Must never be "
+                    "used for PASS/FAIL or trip-time calculation. The "
+                    "*_monotonic_s fields are Pi-side timestamps only - do not "
+                    "map them onto the waveform's own time axis (see "
+                    "waveform_analysis instead, and SCOPE_TRIGGER_DEBUG_LOG.md "
+                    "Entry 13)."
                 ),
                 "software_version": __version__,
-                "forced_at_monotonic_s": forced_at_monotonic_s,
-                "k3_closed_monotonic_s": k3_closed_monotonic_s,
-                "elapsed_since_k3_closed_s": (
-                    forced_at_monotonic_s - k3_closed_monotonic_s
-                    if k3_closed_monotonic_s is not None
-                    else None
-                ),
+                "pi_side_timing": {
+                    "force_command_start_monotonic_s": force_command_start_monotonic_s,
+                    "force_command_return_monotonic_s": force_command_return_monotonic_s,
+                    "forced_acquisition_completion_monotonic_s": (
+                        forced_acquisition_completion_monotonic_s
+                    ),
+                    "k3_closed_monotonic_s": k3_closed_monotonic_s,
+                },
+                "diagnostic_timeline": list(diagnostic_timeline),
+                "waveform_analysis": dict(waveform_analysis) if waveform_analysis is not None else None,
                 "captured_at_utc": capture.captured_at_utc.isoformat(),
                 "settings_readback": dict(capture.settings_readback),
             },

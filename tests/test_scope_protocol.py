@@ -99,6 +99,9 @@ class _FakeScope(ScopeInterface):
     def read_trigger_event_register(self) -> bool:
         return False
 
+    def read_operation_condition(self) -> int:
+        return 0
+
     def force_trigger(self) -> None:
         pass
 
@@ -196,6 +199,7 @@ class HalProtocolTests(unittest.TestCase):
         scope.arm_single()
         self.assertTrue(scope.wait_until_armed(timeout_s=2.0, now_monotonic_s=1.0))
         self.assertFalse(scope.read_trigger_event_register())
+        self.assertEqual(scope.read_operation_condition(), 0)
         self.assertTrue(scope.wait_until_acquisition_complete(timeout_s=5.0, now_monotonic_s=2.0))
         capture = scope.capture_after_acquire()
         self.assertIn("x_increment", capture.preamble)
