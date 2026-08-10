@@ -165,6 +165,7 @@ class ScopeSim(ScopeInterface):
             "ch1_offset": self._settings.channel1_offset_v,
             "ch1_probe_ratio": self._settings.channel1_probe_ratio,
             "trigger_sweep": self._settings.trigger_sweep,
+            "trigger_coupling": self._settings.trigger_coupling,
             "trigger_edge_source": self._settings.trigger_source,
             "trigger_edge_slope": self._settings.trigger_slope,
             "trigger_edge_level": self._settings.trigger_level_v,

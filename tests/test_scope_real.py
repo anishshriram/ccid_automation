@@ -11,6 +11,7 @@ from ccid.hal.scope_real import ScopeReal, _parse_keysight_preamble
 class _FakeInstrument:
     def __init__(self) -> None:
         self.commands: list[str] = []
+        self.queries: list[str] = []
         self.closed = False
         self.timeout = 2000  # ms - PyVISA-style native per-resource timeout
         self.run_bit_sequence = [8, 8, 0]
@@ -31,6 +32,7 @@ class _FakeInstrument:
             raise TimeoutError(self.clear_error_text)
 
     def query(self, command: str) -> str:
+        self.queries.append(command)
         if command in self.fail_commands:
             raise TimeoutError(f"simulated VISA timeout for {command}")
         if command == "*IDN?":
@@ -50,6 +52,9 @@ class _FakeInstrument:
             ":TRIGger:EDGE:LEVel?": "20.0",
             ":TRIGger:MODE?": "EDGE",
             ":TRIGger:SWEep?": "NORMal",
+            ":TRIGger:COUPling?": "DC",
+            ":TRIGger:NREJect?": "0",
+            ":TER?": "0",
             ":TRIGger:EDGE:SOURce?": "CHAN1",
             ":TRIGger:EDGE:SLOPe?": "POS",
             ":CHANnel1:DISPlay?": "1",
@@ -214,6 +219,46 @@ class ScopeRealTests(unittest.TestCase):
                 f"{cmd} must be sent after :CHANnel1:PROBe",
             )
 
+    def test_configure_sets_trigger_coupling_dc_and_disables_noise_reject(self) -> None:
+        # DC, not AC: the trigger comparator must see the raw absolute
+        # voltage for a one-shot transient against a fixed level. Noise
+        # reject is locked off since it adds comparator hysteresis, raising
+        # the effective threshold above the configured level.
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.configure_for_cycle(ScopeSettings())
+
+        self.assertIn(":TRIGger:COUPling DC", rm.inst.commands)
+        self.assertIn(":TRIGger:NREJect OFF", rm.inst.commands)
+
+    def test_configure_sends_opc_sync_barrier_after_commands(self) -> None:
+        # arm_single() is called immediately after configure_for_cycle()
+        # returns - without this barrier it could race ahead of the scope
+        # still internalizing the last few configuration commands.
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.configure_for_cycle(ScopeSettings())
+
+        self.assertIn("*OPC?", rm.inst.queries)
+        # Every configuration write already happened by the time
+        # configure_for_cycle() returns - *OPC? is queried last, after the
+        # full command list, not interleaved with it.
+        self.assertEqual(rm.inst.commands[-1], ":WAVeform:POINts:MODE RAW")
+
     def test_timeout_diagnostics_captures_operation_condition_and_settings(self) -> None:
         rm = _FakeRM()
         rm.inst.run_bit_sequence = [0]
@@ -229,6 +274,9 @@ class ScopeRealTests(unittest.TestCase):
         self.assertEqual(diagnostics.operation_condition, 0)
         self.assertEqual(diagnostics.settings["trigger_mode"], "EDGE")
         self.assertEqual(diagnostics.settings["ch1_coupling"], "AC")
+        self.assertEqual(diagnostics.settings["trigger_coupling"], "DC")
+        self.assertEqual(diagnostics.settings["trigger_noise_reject"], "0")
+        self.assertEqual(diagnostics.settings["trigger_event_register"], "0")
         self.assertEqual(diagnostics.error_queue, ())
         self.assertTrue(diagnostics.scope_png.startswith(b"\x89PNG"))
 

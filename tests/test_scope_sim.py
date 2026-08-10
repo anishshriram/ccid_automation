@@ -109,6 +109,7 @@ class ScopeSimTests(unittest.TestCase):
 
         self.assertEqual(diagnostics.operation_condition, 0)
         self.assertEqual(diagnostics.settings["ch1_coupling"], "AC")
+        self.assertEqual(diagnostics.settings["trigger_coupling"], "DC")
         self.assertEqual(diagnostics.error_queue, ())
         self.assertTrue(diagnostics.scope_png.startswith(b"\x89PNG"))
 

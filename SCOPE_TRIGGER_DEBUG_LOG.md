@@ -10,14 +10,28 @@ up to date rather than buried at the bottom.
 
 ## Current status (as of 2026-08-10)
 
-**Not solved, but a strong new candidate root cause was found and fixed
-(Entry 7) via code review rather than another live trial: `:CHANnel1:PROBe`
-was being sent *after* `:CHANnel1:SCALe`/`:OFFSet` in `configure_for_cycle`.
-On Keysight scopes, scale/offset are interpreted "at the probe tip" using
+**Not solved.** Entry 7's probe-ratio-ordering fix was tried on a real
+energized cycle (Entry 8) and did **not** fix it - channel/trigger-edge
+settings all read back exactly as configured (trigger mode EDGE, source
+CHAN1, positive slope, +20V, probe 10x, scale 50V/div, AC channel
+coupling), K3 backstop opened correctly at ~308ms, and acquisition still
+never completed (`operation_condition = 40` the whole time - the scope
+entered a normal "armed" state and just never left it). That data ruled
+out probe ratio as the (sole) explanation and pointed at two previously
+unexamined areas: trigger coupling/noise-reject (never touched or even
+read before now), and whether the operation-condition run bit actually
+proves "waiting for the intended trigger" as opposed to something else
+that also keeps it set. Entry 8 addresses both, plus adds a `*OPC?`
+synchronization barrier after configuration. **Untested against real
+hardware.**
+
+Earlier: a strong candidate root cause was found and fixed (Entry 7) via
+code review rather than another live trial: `:CHANnel1:PROBe` was being
+sent *after* `:CHANnel1:SCALe`/`:OFFSet` in `configure_for_cycle`. On
+Keysight scopes, scale/offset are interpreted "at the probe tip" using
 whatever probe ratio is already active - setting them first applies them
 against a stale ratio, silently leaving the actual digitized range off by
-the probe factor while every readback still looks correct. This is
-untested against real hardware.** Two other things have been ruled out
+the probe factor while every readback still looks correct. Two other things have been ruled out
 (trigger mode, and previously: AC coupling, centered timebase, STOP
 verification, double-arm-check).
 
@@ -220,7 +234,7 @@ Safe-off ordering, the total time budget, and the primary halt reason are all un
 
 **Result:** `configure_for_cycle` sent `:CHANnel1:SCALe`/`:CHANnel1:OFFSet` before `:CHANnel1:PROBe`. On Keysight scopes, scale/offset are interpreted "at the probe tip" using whatever probe ratio is already active at the time they're sent - so every cycle's `50 V/div` was being applied against a stale probe ratio (possibly `1x` left over from a prior session), then silently reinterpreted once `:CHANnel1:PROBe 10` landed a few commands later. `:CHANnel1:SCALe?` would still read back `50.0` afterward - this bug is invisible to a settings readback, and invisible to `ScopeSim`, which doesn't model probe-ratio-to-scale physics at all.
 
-**Commit:** (pending)
+**Commit:** `bf62eb9`
 
 **What this tells us:** This is a strong, internally-consistent candidate for the actual root cause, not just another ruled-out setting:
 - A real burst reinterpreted through a stale probe ratio could appear as only a fraction of its true voltage in the scope's actual digitized range - consistent with the flat/near-invisible trace in the most recent screenshot and the earlier "no visible CH1 waveform" observations with K1/K2 only.
@@ -229,6 +243,26 @@ Safe-off ordering, the total time budget, and the primary halt reason are all un
 - It explains why 300+ passing tests never caught this: the simulator has no equivalent physics to get wrong.
 
 Fixed: `:CHANnel1:PROBe` now sent first, before `:CHANnel1:SCALe`/`:CHANnel1:OFFSet`/`:CHANnel1:COUPling`. New regression test: `test_configure_sets_probe_ratio_before_scale_and_offset`. **Not yet tested against real hardware** - this is a hypothesis based on documented SCPI scope programming convention, not a confirmed fix. The next real dry run (once diagnostics capture is itself confirmed safe per Entry 6) is what actually tests it.
+
+---
+
+## Entry 8 - 2026-08-10 - Real trial: probe-ratio fix didn't solve it; trigger coupling/noise-reject/OPC-sync/TER added
+
+**What was tried:** A real energized cycle with the Entry 7 probe-ratio fix in place.
+
+**Result:** Failed the same way. Diagnostics captured cleanly this time (no wedge, no segfault - Entries 6/7's fixes held): `operation_condition = 40` for the whole acquisition window, `hal_status` stuck at `ACQUIRING`. Settings readback: trigger mode EDGE, source CHAN1, positive slope, +20V level, probe ratio 10x, channel scale 50V/div, channel coupling AC - all exactly as configured. K3 remained closed ~308ms then opened via the backstop (300ms configured + overhead) - the safety mechanism worked correctly. No acquisition ever completed.
+
+**Commit:** (pending)
+
+**What this tells us:** Every channel/trigger-edge setting we can see is correct, and it still doesn't trigger - this rules out probe ratio as the sole explanation and narrows the remaining unknowns to two things nothing has touched or read before: (1) trigger coupling and noise reject, which are separate from channel coupling and control what the trigger *comparator* sees, not what gets digitized; (2) whether the operation-condition run bit (bit 3, `operation_condition`) actually proves "armed and waiting for the configured edge" as opposed to some other state that also happens to keep bit 3 set (e.g. repeated re-triggering without ever reaching Stop) - `operation_condition = 40` matches the exact "just armed" signature from the original handoff's own real-hardware characterization, which is at least consistent with genuine waiting, but doesn't prove it.
+
+Addressed both, plus a related synchronization gap noticed during the review - `configure_for_cycle` had no barrier ensuring the scope finished processing configuration before `arm_single()` fires immediately after:
+- New `ScopeSettings.trigger_coupling` field, default `DC` (not AC) - the trigger comparator needs the raw absolute voltage for a one-shot transient against a fixed level; AC-coupling the trigger path independently high-pass filters the signal, letting the effective 0V reference drift with recent signal history instead of staying fixed.
+- `:TRIGger:NREJect OFF` sent unconditionally (locked, like `:TRIGger:MODE EDGE` - there's exactly one correct value for this application, not a per-deployment tunable). Noise reject adds trigger-comparator hysteresis, raising the effective threshold above the configured level.
+- `*OPC?` synchronization barrier added at the end of `configure_for_cycle`, before returning - blocks until every queued command has actually finished executing, not just been sent.
+- `:TRIGger:COUPling?`, `:TRIGger:NREJect?`, and `:TER?` (trigger event register - a top-level status register, separate from the operation condition register, that directly answers "has a trigger event occurred" independent of whether acquisition ever reached Stop) added to the timeout-diagnostics query list.
+
+New tests: `test_configure_sets_trigger_coupling_dc_and_disables_noise_reject`, `test_configure_sends_opc_sync_barrier_after_commands`, plus diagnostics assertions for the three new settings keys. Full suite: 305 tests, OK, same 2 intentional skips. **Not yet tested against real hardware.**
 
 ---
 

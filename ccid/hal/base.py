@@ -55,6 +55,12 @@ class ScopeSettings:
     trigger_source: str = "CHANnel1"
     trigger_level_v: float = 20.0
     trigger_slope: str = "POSitive"
+    # DC, not AC: the trigger comparator must see the raw absolute voltage
+    # for a one-shot transient against a fixed level - AC-coupling the
+    # trigger path (independent of channel1_coupling) high-pass filters the
+    # signal before comparison, so the effective 0V reference drifts with
+    # recent signal history instead of staying fixed.
+    trigger_coupling: str = "DC"
     acquire_type: str = "NORMal"
     waveform_source: str = "CHANnel1"
     waveform_format: str = "BYTE"

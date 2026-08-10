@@ -33,6 +33,8 @@ _DIAGNOSTIC_SETTINGS_QUERIES: tuple[tuple[str, str], ...] = (
     ("ch1_invert", ":CHANnel1:INVert?"),
     ("trigger_mode", ":TRIGger:MODE?"),
     ("trigger_sweep", ":TRIGger:SWEep?"),
+    ("trigger_coupling", ":TRIGger:COUPling?"),
+    ("trigger_noise_reject", ":TRIGger:NREJect?"),
     ("trigger_edge_source", ":TRIGger:EDGE:SOURce?"),
     ("trigger_edge_slope", ":TRIGger:EDGE:SLOPe?"),
     ("trigger_edge_level", ":TRIGger:EDGE:LEVel?"),
@@ -42,6 +44,14 @@ _DIAGNOSTIC_SETTINGS_QUERIES: tuple[tuple[str, str], ...] = (
     ("waveform_source", ":WAVeform:SOURce?"),
     ("waveform_format", ":WAVeform:FORMat?"),
     ("waveform_points_mode", ":WAVeform:POINts:MODE?"),
+    # Top-level status register, not part of the :TRIGger:* subsystem -
+    # answers whether a trigger event has actually occurred, independent of
+    # whether the acquisition subsystem ever reached Stop. The operation
+    # condition register's run bit alone (`operation_condition`, elsewhere
+    # in this bundle) only proves "acquisition subsystem is running," not
+    # "waiting for the intended trigger and hasn't seen it yet" - those are
+    # not the same claim.
+    ("trigger_event_register", ":TER?"),
 )
 
 _DIAGNOSTIC_ERROR_QUEUE_MAX_READS = 20
@@ -171,6 +181,15 @@ class ScopeReal(ScopeInterface):
             # explicitly EDGE - the scope keeps triggering on whatever mode
             # (Pattern, Glitch, etc.) it was last left on via the front panel.
             ":TRIGger:MODE EDGE",
+            # Trigger coupling is a separate path from channel1_coupling -
+            # it controls what the trigger comparator sees, not what gets
+            # digitized. Explicit, not left at whatever the front panel had.
+            f":TRIGger:COUPling {settings.trigger_coupling}",
+            # Noise reject adds comparator hysteresis around the trigger
+            # level, raising the effective threshold above the configured
+            # value - never wanted for a one-shot transient against a fixed
+            # level, so this is locked off rather than made configurable.
+            ":TRIGger:NREJect OFF",
             f":TRIGger:EDGE:SOURce {settings.trigger_source}",
             f":TRIGger:EDGE:LEVel {settings.trigger_level_v}",
             f":TRIGger:EDGE:SLOPe {settings.trigger_slope}",
@@ -182,6 +201,12 @@ class ScopeReal(ScopeInterface):
         ]
         for cmd in commands:
             self._write(cmd)
+        # Synchronization barrier: *OPC?  blocks until every queued command
+        # above has actually finished executing on the instrument, not just
+        # been sent. Without this, arm_single() (called immediately after
+        # this method returns) could race ahead of the scope still
+        # internalizing the last few config commands.
+        self._query("*OPC?")
         self._status = ScopeStatus.CONFIGURED
 
     def readback_settings(self) -> Mapping[str, str]:
