@@ -4,11 +4,59 @@ This file is for a fresh coding agent resuming implementation work in this repos
 
 ## Authoritative sources
 
+0. **[SCOPE_TRIGGER_DEBUG_LOG.md](SCOPE_TRIGGER_DEBUG_LOG.md) is the current state of truth for the active
+   scope no-trigger investigation** — read its "Current status" section first. Everything below this
+   point in the present file (test counts, "what remains," etc.) predates that investigation and has
+   not been updated to reflect it; do not treat this file or IMPLEMENTATION_STATUS.md as current for
+   anything scope-related until they're explicitly refreshed.
 1. [handoff_latest.md](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/handoff_latest.md) is the locked technical/safety source.
 2. [coding_instructions.txt](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/coding_instructions.txt) is the required implementation workflow.
 3. [IMPLEMENTATION_STATUS.md](C:/Users/shrirama/OneDrive%20-%20Legrand%20France/Desktop/EE_InternFiles/ccid_automation/IMPLEMENTATION_STATUS.md) is the current implementation log.
 4. [IMPLEMENTATION_QUESTIONS.md](IMPLEMENTATION_QUESTIONS.md) records the material items that are still genuinely
    unresolved (not routine implementation choices) — read this before assuming something is settled.
+
+## Operator rules & safety boundaries
+
+Durable rules from a hardware-commissioning handoff document that was pasted into a prior chat session
+but never saved as a file — reproduced here so they aren't lost. These are operating rules, not status;
+they don't go stale the way test counts do.
+
+**Communication:**
+- Progressive workflow: one small action at a time unless a complete procedure is explicitly requested.
+- Explain rationale once per new topic, not before every command.
+- Stop and diagnose failed gates before advancing; don't repeat an identical energized attempt hoping
+  for a different result.
+- Distinguish clearly among software-only work, low-voltage contactor-coil work, mains-powered EVSE
+  work, and K3 leakage-injection work when describing what an action will touch.
+- Keep a clear distinction between proven facts, observations, hypotheses, and unresolved questions —
+  don't let a hypothesis get cited later as if it were confirmed.
+- No Copilot/AI attribution in commits. Confirm before pushing, and before any critical behavior change.
+
+**Safety (mains + intentional leakage-current injection):**
+- A qualified person controls physical energization, reconnection, protective-earth work, probe
+  placement, and emergency-disconnect readiness — this project's software is not a substitute for that.
+- Never disconnect protective earth or a grounded bench-scope reference while energized.
+- `gpio_selftest exercise` must never be used as a live K3 leakage test — it can hold K3 closed for
+  human-scale seconds. K3's software backstop is 300 ms, but the physical emergency disconnect is still
+  required; the backstop is a last-resort limiter, not the primary safety mechanism.
+- The rig has no dedicated protective-earth continuity input. A PE loss downstream is only detected
+  indirectly (scope never triggers → K3 backstop opens → acquisition times out → halt) — this is
+  consequence detection, not PE-continuity detection.
+- Auxiliary-contact GPIO feedback is deferred (open item). Software contactor state is commanded state
+  only, never physically confirmed.
+- Never weaken `no_pretrigger_leakage` or another V2 sanity check to make a run pass. A numerical PASS
+  with a failed sanity check is invalid and must not be accepted.
+- Don't reuse a run ID, ever, including for a resumed/retried attempt.
+
+**Before authorizing a 5-cycle (or larger) energized campaign, all of these must hold for one fully
+automated cycle, no manual scope interaction:**
+camera waits through boot and grants correctly on sustained green; scope reaches Stop, is verified
+stopped, is configured, is commanded Single, reaches Armed, and stays Armed through a pre-injection
+re-check; K3 closes; the scope triggers *automatically*; K3 opens normally or within the 300 ms backstop;
+acquisition and waveform transfer complete; screenshot and green-LED image are saved; V2 analysis runs
+with a genuine quiet pre-trigger baseline (`no_pretrigger_leakage=true`, `record_spans_no_trip_limit=true`,
+`burst_starts_near_t0=true`, `collapse_is_clean=true`); no rig halt reason; human review accepts the
+waveform and screenshot. This has not yet been achieved — see `SCOPE_TRIGGER_DEBUG_LOG.md`.
 
 ## Current repository state
 
