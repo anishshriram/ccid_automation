@@ -118,6 +118,21 @@ supervised energized cycle's diagnostics bundle will show.
    waveform during K3) to narrow down what the screenshot + `scope_state.json`
    actually show.
 
+
+## Entry 3 - 2026-08-10 - Real-scope diagnostics exposed USBTMC timeout risk
+
+**What was tried:** A de-energized dry run invoked the timeout-diagnostics method against the physical MSO-X 2014A. EVSE mains and all three 12 V contactor supplies were off.
+
+**Result:** The operation appeared to hang and required termination from a second SSH session. A completed attempt later reported operation_condition = -1, png_bytes = 0, and query_failures = 20. Every scope operation failed with Errno 110: Operation timed out. Basic IDN communication also failed afterward.
+
+USB reconnect, a normal scope power cycle, a Pi reboot, a replacement USB cable, and a different Pi USB port did not restore communication. Linux continued to detect the correct scope, serial number, VISA resource, and USBTMC interface.
+
+A true cold restart of the oscilloscope, including removing its AC power for 60 seconds, restored communication. After recovery, the IDN query returned AGILENT TECHNOLOGIES, MSO-X 2014A, MY58100795, 02.43.2018020635 with exit status 0.
+
+**Commit:** 39a801e contains the initial timeout-diagnostics implementation. A corrective commit is required.
+
+**What this tells us:** Diagnostics must not run while K1/K2 remain energized. The corrected sequence must open K3, open K2/K1, and only then attempt diagnostics. Diagnostic operations require strict per-query and overall time limits. Failures must preserve partial evidence and must never replace the primary halt reason, rig:scope_never_triggered_or_acquire_timeout.
+
 ---
 
 ## Template for new entries
