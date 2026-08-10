@@ -36,7 +36,7 @@ import zipfile
 
 from ccid import __version__
 from ccid.errors import ConfigHashMismatchError, PersistenceError, ResumeBlockedError
-from ccid.hal.base import ScopeTimeoutDiagnostics
+from ccid.hal.base import ScopeTimeoutDiagnostics, WaveformCapture
 
 
 @dataclass(frozen=True)
@@ -303,6 +303,60 @@ class RunRecorder:
         )
         errors_text = "\n".join(diagnostics.error_queue) + "\n" if diagnostics.error_queue else "no errors\n"
         self._write_bytes_and_fsync(diag_dir / "scope_errors.txt", errors_text.encode("utf-8"))
+
+    def write_forced_diagnostic_capture(
+        self,
+        *,
+        run_dir: Path,
+        run_id: str,
+        cycle_index: int,
+        capture: WaveformCapture,
+        forced_at_monotonic_s: float,
+        k3_closed_monotonic_s: float | None,
+    ) -> None:
+        """Best-effort evidence capture for a diagnostic-only forced
+        trigger (SCOPE_TRIGGER_DEBUG_LOG.md Entry 11) - a real trigger
+        never occurred this cycle, so this is not a measurement.
+
+        Written only under diagnostics/<cycle_index>/, never
+        waveforms/ or images/ - anything reading the normal per-cycle
+        artifact tree (replay, analysis, commit) must never encounter
+        this data. Like `write_timeout_diagnostics`, outside the
+        crash-safe commit contract: no runstate.json, no
+        `last_completed_cycle` advance.
+        """
+
+        diag_dir = run_dir / "diagnostics" / str(cycle_index)
+        self._write_waveform_npz(
+            diag_dir / "forced_diagnostic_waveform.npz",
+            samples=capture.samples,
+            preamble=capture.preamble,
+        )
+        self._write_bytes_and_fsync(diag_dir / "forced_diagnostic_scope.png", capture.scope_png)
+        self._write_json_and_fsync(
+            diag_dir / "forced_diagnostic_state.json",
+            {
+                "run_id": run_id,
+                "cycle_index": cycle_index,
+                "capture_type": "forced_diagnostic_non_measurement",
+                "note": (
+                    "Forced via :TRIGger:FORCe because a real trigger had not "
+                    "occurred ~100 ms after K3 closed - not a real trigger "
+                    "event. Must never be used for PASS/FAIL or trip-time "
+                    "calculation."
+                ),
+                "software_version": __version__,
+                "forced_at_monotonic_s": forced_at_monotonic_s,
+                "k3_closed_monotonic_s": k3_closed_monotonic_s,
+                "elapsed_since_k3_closed_s": (
+                    forced_at_monotonic_s - k3_closed_monotonic_s
+                    if k3_closed_monotonic_s is not None
+                    else None
+                ),
+                "captured_at_utc": capture.captured_at_utc.isoformat(),
+                "settings_readback": dict(capture.settings_readback),
+            },
+        )
 
     def _checkpoint(self, step_name: str) -> None:
         if self._crash_injector is not None:

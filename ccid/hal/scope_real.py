@@ -284,6 +284,9 @@ class ScopeReal(ScopeInterface):
         self._require_connected()
         return int(float(self._query(":TER?"))) != 0
 
+    def force_trigger(self) -> None:
+        self._write(":TRIGger:FORCe")
+
     def capture_after_acquire(self) -> WaveformCapture:
         self._require_connected()
         samples = self._query_binary(":WAVeform:DATA?")

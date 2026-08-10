@@ -99,6 +99,9 @@ class _FakeScope(ScopeInterface):
     def read_trigger_event_register(self) -> bool:
         return False
 
+    def force_trigger(self) -> None:
+        pass
+
     def capture_after_acquire(self) -> WaveformCapture:
         return WaveformCapture(
             samples=b"\x01\x02",

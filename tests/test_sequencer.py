@@ -172,6 +172,32 @@ class _ConfigFailureScope(ScopeSim):
         raise ScopeConfigurationError("simulated rejected configuration command")
 
 
+class _TriggeredButNeverCompletesScope(ScopeSim):
+    """TER already reads 1 by the time the live post-K3 forced-diagnostic
+    checkpoint runs, but the acquisition itself never completes -
+    SCOPE_TRIGGER_DEBUG_LOG.md Entry 10's "triggered but stuck" case. The
+    forced-diagnostic checkpoint (Entry 11) must see this and skip
+    forcing; a real trigger already occurred and forcing would be neither
+    needed nor appropriate."""
+
+    def __init__(self, *, clock: _ManualClock, scenario: ScopeSimScenario) -> None:
+        super().__init__(scenario=scenario, monotonic_now=clock.now)
+        self.force_trigger_calls = 0
+        self._ter_calls = 0
+
+    def read_trigger_event_register(self) -> bool:
+        self._ter_calls += 1
+        # First two live checkpoints (post-configure baseline,
+        # pre-injection recheck) must see a clean 0 so the cycle reaches
+        # K3 close; only the forced-diagnostic checkpoint after K3 closes
+        # should see the (simulated) real trigger event.
+        return self._ter_calls > 2
+
+    def force_trigger(self) -> None:
+        self.force_trigger_calls += 1
+        super().force_trigger()
+
+
 class _TwoHueCamera:
     """Always returns a genuinely two-hue (blue+red) frame, exercising the
     real per-frame >=2-hues BOOTING classification directly rather than
@@ -438,6 +464,71 @@ class SequencerTests(unittest.TestCase):
         self.assertEqual(result.terminal, Terminal.RIG_FAULT)
         self.assertIn("scope_never_triggered_or_acquire_timeout", result.halt_reason or "")
         self.assertNotIn("scope_triggered_but_acquisition_not_completed", result.halt_reason or "")
+
+    def test_forced_diagnostic_capture_when_ter_still_zero(self) -> None:
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 11: real hardware confirmed
+        # TER=0 for the full 306.6 ms K3-closed window - a genuine
+        # no-trigger condition. The forced-diagnostic capture must fire
+        # ~100 ms after K3 closes, land only under the diagnostics tree,
+        # be clearly labeled non-measurement, and never change the halt
+        # reason or produce a normal-cycle artifact.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(never_triggered=True)
+        # Plain ScopeSim is enough - TER reads 0 by default, matching the
+        # real-hardware finding this entry is based on.
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertIn("scope_never_triggered_or_acquire_timeout", result.halt_reason or "")
+
+        diag_dir = run_dir / "diagnostics" / "1"
+        self.assertTrue((diag_dir / "forced_diagnostic_waveform.npz").exists())
+        self.assertTrue((diag_dir / "forced_diagnostic_scope.png").exists())
+        forced_state_path = diag_dir / "forced_diagnostic_state.json"
+        self.assertTrue(forced_state_path.exists())
+        forced_state = json.loads(forced_state_path.read_text(encoding="utf-8"))
+        self.assertEqual(forced_state["capture_type"], "forced_diagnostic_non_measurement")
+        self.assertGreaterEqual(forced_state["elapsed_since_k3_closed_s"], 0.1)
+
+        scope_state = json.loads((diag_dir / "scope_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(scope_state["k3_open_reason"], "backstop")
+
+        # Never a measurement: no normal per-cycle artifact exists.
+        self.assertFalse((run_dir / "waveforms" / "1.npz").exists())
+        self.assertFalse((run_dir / "images" / "1_scope.png").exists())
+
+    def test_forced_diagnostic_capture_skipped_when_trigger_event_already_confirmed(self) -> None:
+        # A real trigger event by the ~100 ms checkpoint means forcing is
+        # neither needed nor appropriate - and the classification must
+        # still reflect the real trigger via the live-latched TER read,
+        # since capture_timeout_diagnostics' own later :TER? read would
+        # otherwise see 0 (read-and-clear already consumed it here).
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(never_triggered=True)
+        scope = _TriggeredButNeverCompletesScope(clock=self.clock, scenario=scenario)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertIn("scope_triggered_but_acquisition_not_completed", result.halt_reason or "")
+        self.assertEqual(scope.force_trigger_calls, 0)
+        self.assertFalse((run_dir / "diagnostics" / "1" / "forced_diagnostic_state.json").exists())
 
     def test_stale_trigger_event_before_arm_halts_before_arming(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)

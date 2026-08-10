@@ -268,6 +268,24 @@ class ScopeRealTests(unittest.TestCase):
 
         self.assertTrue(scope.read_trigger_event_register())
 
+    def test_force_trigger_sends_documented_command(self) -> None:
+        # :TRIGger:FORCe - confirmed against the Keysight InfiniiVision
+        # 2000 X-Series Programmer's Guide (this exact model family):
+        # write-only, no arguments, no query form, equivalent to the
+        # front-panel [Force Trigger] key. See
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 11.
+        rm = _FakeRM()
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.force_trigger()
+
+        self.assertIn(":TRIGger:FORCe", rm.inst.commands)
+
     def test_configure_sends_opc_sync_barrier_after_commands(self) -> None:
         # arm_single() is called immediately after configure_for_cycle()
         # returns - without this barrier it could race ahead of the scope

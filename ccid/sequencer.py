@@ -69,6 +69,14 @@ _SCOPE_TRIGGERED_BUT_ACQUISITION_NOT_COMPLETED_REASON = "scope_triggered_but_acq
 _SCOPE_STALE_TRIGGER_EVENT_BEFORE_ARM_REASON = "scope_stale_trigger_event_before_arm"
 _SCOPE_TRIGGER_EVENT_BEFORE_INJECTION_REASON = "scope_trigger_event_before_injection"
 
+# Entry 11: real-hardware evidence (TER=0 for the full 306.6 ms K3-closed
+# window) confirmed a genuine no-trigger condition, not a
+# triggered-but-stuck one. This delay gates a diagnostic-only forced
+# acquisition (:TRIGger:FORCe) to see what the analog front end actually
+# looks like when the real trigger doesn't fire - it is well inside the
+# 300 ms K3 backstop, which this must never delay or otherwise affect.
+_FORCED_DIAGNOSTIC_DELAY_S = 0.1
+
 
 class FaultCategory(str, Enum):
     DUT = "dut"
@@ -123,6 +131,13 @@ class _CycleContext:
     k3_closed_monotonic_s: float | None = None
     k3_open_monotonic_s: float | None = None
     k3_open_reason: str | None = None
+    # Entry 11: set if a live checkpoint read ever confirmed TER=1 this
+    # cycle. read_trigger_event_register() is read-and-clear, so this is
+    # the only record of that fact once a later read (or the post-timeout
+    # diagnostics bundle's own :TER? query) would otherwise see a
+    # since-cleared 0 and lose the evidence.
+    live_trigger_event_seen: bool = False
+    forced_diagnostic_triggered_at_monotonic_s: float | None = None
 
 
 class Sequencer:
@@ -479,6 +494,8 @@ class Sequencer:
             # SCOPE_TRIGGER_DEBUG_LOG.md Entry 3 for the incident that
             # required this ordering.
             self._open_mains_with_cooldown(context, include_cooldown=False)
+            if context.forced_diagnostic_triggered_at_monotonic_s is not None:
+                self._capture_forced_diagnostic_best_effort(context, run_dir=run_dir, run_id=run_id)
             reason = self._capture_timeout_diagnostics_best_effort(
                 context, run_dir=run_dir, run_id=run_id
             )
@@ -509,9 +526,23 @@ class Sequencer:
         start_s = self._now()
         acq_timeout_s = self._config.timing.scope_acquisition_timeout_s
         k3_deadline = k3_closed_s + self._config.timing.k3_backstop_s
+        forced_diagnostic_deadline = k3_closed_s + _FORCED_DIAGNOSTIC_DELAY_S
         opened = False
+        forced_diagnostic_attempted = False
         while self._now() - start_s <= acq_timeout_s:
             now_s = self._now()
+            if (
+                not forced_diagnostic_attempted
+                and not opened
+                and now_s >= forced_diagnostic_deadline
+            ):
+                # Fast, bounded live-window work only (one TER read, one
+                # fire-and-forget write) - see
+                # _issue_forced_diagnostic_trigger. The actual waveform/PNG
+                # transfer is deferred until after full safe-off so it can
+                # never delay the backstop check just below.
+                forced_diagnostic_attempted = True
+                self._issue_forced_diagnostic_trigger(context, now_s=now_s)
             if not opened and now_s >= k3_deadline:
                 self._transition(
                     context.transitions,
@@ -523,6 +554,18 @@ class Sequencer:
                 context.k3_open_monotonic_s = self._now()
                 context.k3_open_reason = "backstop"
                 opened = True
+            if forced_diagnostic_attempted:
+                # A forced trigger consumes the same single-shot
+                # acquisition a real measurement would use -
+                # wait_until_acquisition_complete can no longer distinguish
+                # "genuinely triggered" from "we just forced it," so once
+                # forced this loop must never again treat "complete" as a
+                # real measurement success (SCOPE_TRIGGER_DEBUG_LOG.md
+                # Entry 11). It still only returns via the backstop/timeout
+                # paths below, exactly as an unforced no-trigger cycle
+                # already does.
+                self._sleep(0.01)
+                continue
             if self._scope.wait_until_acquisition_complete(
                 timeout_s=min(0.01, acq_timeout_s - (now_s - start_s)),
                 now_monotonic_s=now_s,
@@ -551,6 +594,72 @@ class Sequencer:
             context.k3_open_reason = "acquisition_timeout"
         return False
 
+    def _issue_forced_diagnostic_trigger(self, context: _CycleContext, *, now_s: float) -> None:
+        # Only the fast, bounded live-window operations happen here: one
+        # :TER? read and one fire-and-forget :TRIGger:FORCe write, both the
+        # same class of call already trusted elsewhere in this loop (e.g.
+        # :OPERegister:CONDition? polled every ~10 ms). The actual
+        # waveform/PNG transfer - the part that could plausibly stall, per
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 6 - is deliberately deferred to
+        # _capture_forced_diagnostic_best_effort, called only after full
+        # safe-off, so it can never delay the 300 ms K3 backstop check this
+        # method runs alongside.
+        try:
+            if self._scope.read_trigger_event_register():
+                # A real trigger occurred - forcing is neither needed nor
+                # appropriate. Latched locally because this read just
+                # cleared TER, so it's the only remaining record for Entry
+                # 10's post-timeout reclassification.
+                context.live_trigger_event_seen = True
+                return
+        except Exception as exc:
+            self._logger.warning(
+                "cycle=%d forced-diagnostic TER pre-check failed, skipping force: %s",
+                context.cycle_index,
+                exc,
+            )
+            return
+        try:
+            self._scope.force_trigger()
+        except Exception as exc:
+            self._logger.warning(
+                "cycle=%d force_trigger() failed: %s", context.cycle_index, exc
+            )
+            return
+        context.forced_diagnostic_triggered_at_monotonic_s = now_s
+
+    def _capture_forced_diagnostic_best_effort(self, context: _CycleContext, *, run_dir, run_id: str) -> None:
+        # Same best-effort contract as _capture_timeout_diagnostics_best_effort:
+        # an exception here must never prevent safe-off (already complete by
+        # the time the caller invokes this) or affect the halt reason -
+        # this method's only job is preserving evidence.
+        self._transition(
+            context.transitions,
+            cycle_index=context.cycle_index,
+            state=CycleState.FORCED_DIAGNOSTIC_CAPTURING,
+            detail="forced_trigger",
+        )
+        try:
+            capture = self._scope.capture_after_acquire()
+        except Exception as exc:
+            self._logger.warning(
+                "cycle=%d forced-diagnostic capture failed: %s", context.cycle_index, exc
+            )
+            return
+        try:
+            self._recorder.write_forced_diagnostic_capture(
+                run_dir=run_dir,
+                run_id=run_id,
+                cycle_index=context.cycle_index,
+                capture=capture,
+                forced_at_monotonic_s=context.forced_diagnostic_triggered_at_monotonic_s,
+                k3_closed_monotonic_s=context.k3_closed_monotonic_s,
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "cycle=%d forced-diagnostic write failed: %s", context.cycle_index, exc
+            )
+
     def _capture_timeout_diagnostics_best_effort(self, context: _CycleContext, *, run_dir, run_id: str) -> str:
         # Best-effort by design: an exception here must never prevent
         # safe-off or replace the primary halt reason (handoff safety
@@ -559,15 +668,23 @@ class Sequencer:
         # diagnostics call must never be able to delay de-energizing the
         # EVSE mains.
         #
-        # Returns the halt reason to raise: the trigger-event-register
-        # value already present in the diagnostics bundle (Entry 8) decides
-        # between the generic never-triggered reason and the more specific
+        # Returns the halt reason to raise: either a live checkpoint read
+        # already confirmed TER=1 this cycle (Entry 11's
+        # context.live_trigger_event_seen - a fact that a later :TER? read
+        # elsewhere can no longer see, since the register is read-and-
+        # clear), or the trigger-event-register value already present in
+        # the diagnostics bundle (Entry 8) does. Either decides between the
+        # generic never-triggered reason and the more specific
         # triggered-but-not-completed reason (Entry 10). A failed/partial
         # diagnostics capture - or a `trigger_event_register` reading this
         # method can't parse - falls back to the generic, already-proven
         # reason rather than asserting a trigger occurred on incomplete
         # evidence.
-        reason = _SCOPE_TIMEOUT_REASON
+        reason = (
+            _SCOPE_TRIGGERED_BUT_ACQUISITION_NOT_COMPLETED_REASON
+            if context.live_trigger_event_seen
+            else _SCOPE_TIMEOUT_REASON
+        )
         self._transition(
             context.transitions,
             cycle_index=context.cycle_index,

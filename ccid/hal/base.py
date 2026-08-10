@@ -255,6 +255,22 @@ class ScopeInterface(ABC):
         pass
 
     @abstractmethod
+    def force_trigger(self) -> None:
+        """Sends `:TRIGger:FORCe` - the documented remote equivalent of the
+        front-panel [Force Trigger] key (confirmed against the Keysight
+        InfiniiVision 2000 X-Series Programmer's Guide, which covers this
+        exact model family). Causes the currently-armed acquisition to be
+        captured even though the trigger condition has not been met.
+
+        Diagnostic use only: this consumes the same single-shot
+        acquisition a real measurement would use, so a caller that forces
+        a trigger must never treat the resulting completion as a genuine
+        triggered acquisition, and the resulting data must never be used
+        for PASS/FAIL or trip-time calculation. See
+        SCOPE_TRIGGER_DEBUG_LOG.md Entry 11."""
+        pass
+
+    @abstractmethod
     def capture_after_acquire(self) -> WaveformCapture:
         pass
 

@@ -10,39 +10,44 @@ up to date rather than buried at the bottom.
 
 ## Current status (as of 2026-08-10)
 
-**Not solved, but reframed.** Entry 9's config-error-blocking fix has since
+**Not solved, but narrowed to a genuine no-trigger condition - do not touch
+normal trigger settings again.** Entry 9's config-error-blocking fix has
 been **confirmed clean on real hardware** (operator-verified `configure
---real` check: no rejected commands, no exception) - that part of the
-investigation is closed.
+--real` check: no rejected commands, no exception). Entry 10's TER
+instrumentation has now also run on a real energized cycle: `TER = 0`,
+`operation_condition = 40`, `hal_status = ACQUIRING` for the full 306.6 ms
+K3-closed window. Unlike the Entry 8 reading that motivated Entry 10 (`TER =
++1`, prompting the "triggered but stuck" hypothesis), this run's TER stayed
+0 throughout - a **proven, confirmed genuine no-trigger condition**, not a
+triggered-but-uncompleted one. Per operator instruction: trigger mode,
+coupling, edge source/slope/level, and probe ratio (Entries 1, 7, 8) have
+now all been checked and correctly configured multiple times without
+resolving the halt - **do not modify normal trigger settings again** without
+new evidence specifically implicating one.
 
-The active new fact is from a real energized cycle's diagnostics bundle:
-`trigger_event_register` (`:TER?`) read back `+1` while `operation_condition`
-stayed at `40` for the whole window and `hal_status` stayed `ACQUIRING`. This
-is a **proven fact, not a hypothesis**, and it changes the framing of the
-whole investigation: `:TER?` is a top-level status register that latches
-independently of the operation-condition run bit - a `+1` reading means the
-trigger comparator *did* see a qualifying edge. Every earlier entry's "never
-triggered" language describes a state (run bit never clears) that turns out
-to be consistent with two different underlying conditions: a genuine
-no-trigger, or a real trigger whose occurrence the acquisition subsystem
-never signaled as Stop. Those are different failure modes and were being
-collapsed into one halt reason.
+Entry 11 adds a diagnostic-only forced capture: if TER is still 0
+~100 ms after K3 closes, `:TRIGger:FORCe` (confirmed via the official
+Keysight InfiniiVision 2000 X-Series Programmer's Guide - this exact model
+family, write-only, no query form, equivalent to the front-panel [Force
+Trigger] key) forces the pending single-shot acquisition to complete so the
+resulting waveform shows what the analog front end actually looked like
+partway through the closed window. The command itself fires live, but the
+data transfer is deferred until after full safe-off so it can never delay
+the unchanged 300 ms K3 backstop. Data is written only under
+`diagnostics/<cycle>/`, explicitly labeled
+`"capture_type": "forced_diagnostic_non_measurement"`, and never reaches
+`analyze_waveform`, PASS/FAIL, or trip-time calculation. **Untested against
+real hardware** - the next energized cycle is the first real test of
+whether the forced capture actually shows something diagnostically useful
+about why the real trigger never fires.
 
-Entry 10 adds `read_trigger_event_register()` (`:TER?`) as a live checkpoint
-read at two points - immediately after `configure_for_cycle` (baseline,
-before arm) and immediately before K3 closes (pre-injection recheck) - plus
-uses the `trigger_event_register` value already captured by the existing
-post-timeout diagnostics bundle (Entry 8) to split the old generic timeout
-halt into two distinct reasons: `scope_never_triggered_or_acquire_timeout`
-(TER confirmed 0, or unknown) vs. `scope_triggered_but_acquisition_not_completed`
-(TER confirmed 1). Deliberately does **not** poll `:TER?` inside the 10 ms
-acquisition/backstop loop - see Entry 10 for why. **Untested against real
-hardware** - the next energized cycle is what will actually show, for the
-first time, whether the halt reason for the next occurrence of this failure
-comes back as the generic reason or the new triggered-but-not-completed one.
-Also still unconfirmed: whether `:TER?` is read-and-clear on this specific
-instrument (assumed per SCPI convention, not yet independently verified the
-way `:TRIGger:NREJect`'s unsupported status was in Entry 9).
+Also still unconfirmed independently on this unit (though now strongly
+supported by the official manual, which explicitly states `:TER?` is
+read-and-clear): whether that documented behavior is what this specific
+MSO-X 2014A actually does - the project's own experience with
+`:TRIGger:NREJect` (documented, but confirmed unsupported on this unit in
+Entry 9) is a standing reason not to fully equate "documented" with
+"confirmed on this hardware."
 
 Entry 7's probe-ratio-ordering fix was tried on a real
 energized cycle (Entry 8) and did **not** fix it - channel/trigger-edge
@@ -393,6 +398,120 @@ New tests: `test_read_trigger_event_register_false_when_clear`,
 `test_scope_stale_trigger_event_before_arm_row`,
 `test_scope_trigger_event_before_injection_row` (`test_faultmatrix.py`). Full
 suite: 322 tests, OK, same 2 intentional skips.
+
+---
+
+## Entry 11 - 2026-08-10 - Diagnostic-only forced trigger when TER stays 0 through the K3 window
+
+**What was tried:** A real energized cycle with Entry 10's TER
+instrumentation live produced `TER = 0`, `operation_condition = 40`,
+`hal_status = ACQUIRING` for the entire 306.6 ms K3-closed window - TER
+never latched at all. Unlike Entry 8's `TER = +1` reading (which motivated
+Entry 10's "triggered but stuck" hypothesis), this is unambiguous: a genuine
+no-trigger condition, confirmed rather than hypothesized. Per operator
+instruction, normal trigger settings (mode, coupling, edge source/slope/
+level, probe ratio - Entries 1, 7, 8) are not to be changed again without
+new evidence specifically implicating one of them.
+
+**SCPI command confirmation (done before writing any code):** Fetched the
+official Keysight InfiniiVision 2000 X-Series Oscilloscopes Programmer's
+Guide (`https://www.keysight.com/us/en/assets/9018-06893/programming-guides/9018-06893.pdf`,
+mirrored copy fetched from `batronix.com` and text-extracted with
+`pdftotext` since the direct Keysight fetch returned only site chrome) -
+this model family covers the MSO-X 2014A directly, not a cross-series
+inference. Confirmed:
+- `:TRIGger:FORCe` - write-only, no arguments, no query form ("n/a" for
+  both in the command summary table). "Causes an acquisition to be captured
+  even though the trigger condition has not been met... equivalent to the
+  front panel [Force Trigger] key." Documented since firmware v1.20; this
+  unit's firmware is v2.43 (from Entry 3's `*IDN?` capture), so it predates
+  this unit's software easily.
+- `:TER?` (already in use since Entry 8) is explicitly documented as
+  read-and-clear: "After the Trigger Event Register is read, it is
+  cleared." This confirms an assumption Entry 10 had flagged as unverified.
+- Caution carried forward from Entry 9: `:TRIGger:NREJect` is *also*
+  documented in this same manual's command summary table, yet was confirmed
+  unsupported on this specific unit. Documentation is strong evidence, not
+  proof-on-this-unit - `:TRIGger:FORCe` is still unconfirmed against the
+  real instrument until the next real dry run.
+
+**Design (two safety properties that needed explicit handling, beyond what
+was directly specified):**
+1. `:TRIGger:FORCe` completes the *same* single-shot acquisition a real
+   trigger would - it is not a separate diagnostic channel. Once issued,
+   `wait_until_acquisition_complete`'s run-bit-clear signal can no longer
+   distinguish "genuinely triggered" from "we just forced it." So
+   `_poll_acquisition_with_backstop` now latches `forced_diagnostic_attempted`
+   and, once set, never again calls `wait_until_acquisition_complete` for
+   real-measurement-success purposes - the loop only returns via the
+   unchanged backstop/timeout paths from that point on, exactly as an
+   unforced no-trigger cycle already does.
+2. The force command itself (single write) and a `:TER?` pre-check (single
+   read) are fast, bounded live-window calls - the same class already
+   trusted in this loop (e.g. `:OPERegister:CONDition?`, polled every
+   ~10 ms). The waveform/preamble/PNG *transfer*, however, is exactly the
+   kind of call that stalled for over a second in Entry 6 - so it is
+   deliberately deferred to `_capture_forced_diagnostic_best_effort`,
+   called only after full safe-off (same ordering already established for
+   Entry 8's timeout diagnostics, same reason: a slow transfer here must
+   never be able to delay opening K3). The acquisition itself is already
+   frozen in the scope's memory the instant `:TRIGger:FORCe` completes it;
+   only reading that memory out is deferred, not what gets captured.
+
+Also: since `:TER?` is read-and-clear, the `:TER?` pre-check that gates
+forcing (only force if TER is confirmed 0) would itself destroy evidence of
+a real trigger if TER happened to be 1 at that exact checkpoint - so that
+read latches into `context.live_trigger_event_seen`, which Entry 10's
+post-timeout reclassification now also consults (OR'd with the diagnostics
+bundle's own fresh `:TER?` read) rather than relying solely on a
+diagnostics-time read that could no longer see an already-cleared 1.
+
+**Implementation:**
+- `ScopeInterface.force_trigger()` (new abstract method), implemented in
+  `ScopeReal` (`:TRIGger:FORCe` via `_write`) and `ScopeSim`
+  (`wait_until_acquisition_complete` now returns `True` immediately once
+  forced, mirroring the real completion behavior described above; reset
+  each `configure_for_cycle`).
+- `_poll_acquisition_with_backstop` gains a `_FORCED_DIAGNOSTIC_DELAY_S =
+  0.1` checkpoint: if TER is confirmed 0 and K3 hasn't already opened,
+  issues the force (fast phase only) via `_issue_forced_diagnostic_trigger`.
+- `_capture_forced_diagnostic_best_effort` (deferred phase, called only
+  after `_open_mains_with_cooldown`) reuses `capture_after_acquire()` to
+  retrieve the already-frozen waveform/preamble/PNG and persists it via a
+  new `RunRecorder.write_forced_diagnostic_capture()` - writes only
+  `diagnostics/<cycle>/forced_diagnostic_{waveform.npz,scope.png,state.json}`,
+  never `waveforms/` or `images/`. `forced_diagnostic_state.json` includes
+  `"capture_type": "forced_diagnostic_non_measurement"`, the SCPI command
+  used, elapsed time since K3 closed, and an explicit note that it must
+  never be used for PASS/FAIL or trip-time calculation. Nothing in this
+  path touches `analyze_waveform`, the cycle's `Verdict`, or any file
+  outside the diagnostics tree - a forced cycle still halts via the
+  existing (Entry 10-aware) timeout/reclassification path exactly as an
+  unforced no-trigger cycle does.
+- The 300 ms K3 backstop's own deadline check, deadline value, and
+  `open_k3()` call are untouched - the forced-diagnostic checkpoint is
+  purely additive and only ever fires strictly before the backstop
+  (`not opened` guard), never after.
+
+**Commit:** (pending)
+
+**Result:** Not yet tried against real hardware.
+
+**What this tells us:** Nothing about root cause yet - same as Entry 2 and
+Entry 10, this is instrumentation. Its value is entirely in what the forced
+capture's waveform/screenshot show on the next real no-trigger cycle: signal
+absent entirely (front-end/probe/wiring issue upstream of the trigger
+comparator), signal present but below/at the configured +20 V level (trigger
+level or comparator issue), or signal present and clearly above +20 V
+(points toward the trigger circuit itself, e.g. holdoff or an
+acquire-mode interaction, rather than anything already checked).
+
+New tests: `test_force_trigger_sends_documented_command` (`test_scope_real.py`);
+`test_force_trigger_completes_a_never_triggered_acquisition`,
+`test_force_trigger_state_resets_on_next_configure` (`test_scope_sim.py`);
+`test_forced_diagnostic_capture_when_ter_still_zero`,
+`test_forced_diagnostic_capture_skipped_when_trigger_event_already_confirmed`
+(`test_sequencer.py`). Full suite: 327 tests, OK, same 2 intentional skips.
 
 ---
 

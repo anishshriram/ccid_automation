@@ -46,6 +46,46 @@ class ScopeSimTests(unittest.TestCase):
         self.assertFalse(scope.wait_until_acquisition_complete(timeout_s=5.0, now_monotonic_s=self.clock.now()))
         self.assertEqual(scope.status(), ScopeStatus.ARMED)
 
+    def test_force_trigger_completes_a_never_triggered_acquisition(self) -> None:
+        scope = ScopeSim(
+            scenario=ScopeSimScenario(never_triggered=True),
+            monotonic_now=self.clock.now,
+        )
+        scope.connect()
+        scope.configure_for_cycle(ScopeSettings())
+        scope.arm_single()
+        scope.wait_until_armed(timeout_s=2.0, now_monotonic_s=self.clock.now())
+        self.clock.advance(0.1)
+        self.assertFalse(
+            scope.wait_until_acquisition_complete(timeout_s=1.0, now_monotonic_s=self.clock.now())
+        )
+
+        scope.force_trigger()
+
+        self.assertTrue(
+            scope.wait_until_acquisition_complete(timeout_s=1.0, now_monotonic_s=self.clock.now())
+        )
+        self.assertEqual(scope.status(), ScopeStatus.COMPLETE)
+
+    def test_force_trigger_state_resets_on_next_configure(self) -> None:
+        scope = ScopeSim(
+            scenario=ScopeSimScenario(never_triggered=True),
+            monotonic_now=self.clock.now,
+        )
+        scope.connect()
+        scope.configure_for_cycle(ScopeSettings())
+        scope.force_trigger()
+
+        # A fresh configure_for_cycle (start of the next cycle) must not
+        # inherit the previous cycle's forced-trigger state.
+        scope.configure_for_cycle(ScopeSettings())
+        scope.arm_single()
+        scope.wait_until_armed(timeout_s=2.0, now_monotonic_s=self.clock.now())
+
+        self.assertFalse(
+            scope.wait_until_acquisition_complete(timeout_s=1.0, now_monotonic_s=self.clock.now())
+        )
+
     def test_trigger_event_register_clear_by_default(self) -> None:
         scope = ScopeSim(monotonic_now=self.clock.now)
         scope.connect()

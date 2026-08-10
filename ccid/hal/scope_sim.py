@@ -67,6 +67,7 @@ class ScopeSim(ScopeInterface):
         self._armed_s: float | None = None
         self._acquire_started_s: float | None = None
         self._trigger_event_latched = False
+        self._force_triggered = False
 
     def connect(self) -> None:
         self._maybe_raise("connect")
@@ -92,6 +93,7 @@ class ScopeSim(ScopeInterface):
         self._armed_s = None
         self._acquire_started_s = None
         self._trigger_event_latched = self._scenario.trigger_event_latched_at_configure
+        self._force_triggered = False
 
     def readback_settings(self) -> dict[str, str]:
         self._require_connected()
@@ -137,6 +139,13 @@ class ScopeSim(ScopeInterface):
             raise ValueError("timeout_s must be > 0")
         if self._armed_s is None or self._acquire_started_s is None:
             return False
+        if self._force_triggered:
+            # Mirrors real-hardware behavior: :TRIGger:FORCe completes the
+            # currently-armed acquisition immediately, indistinguishable
+            # here from a genuine trigger - callers that force a trigger
+            # must not call this method expecting to tell the difference.
+            self._status = ScopeStatus.COMPLETE
+            return True
         if self._scenario.never_triggered:
             self._status = ScopeStatus.ARMED
             return False
@@ -156,6 +165,11 @@ class ScopeSim(ScopeInterface):
         latched = self._trigger_event_latched
         self._trigger_event_latched = False
         return latched
+
+    def force_trigger(self) -> None:
+        self._require_connected()
+        self._maybe_raise("force_trigger")
+        self._force_triggered = True
 
     def capture_after_acquire(self) -> WaveformCapture:
         self._require_connected()
