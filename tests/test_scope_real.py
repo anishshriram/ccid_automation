@@ -189,6 +189,31 @@ class ScopeRealTests(unittest.TestCase):
                 f"{cmd} must be sent after :TRIGger:MODE EDGE",
             )
 
+    def test_configure_sets_probe_ratio_before_scale_and_offset(self) -> None:
+        # Regression: :CHANnel:SCALe/:OFFSet are interpreted "at the probe
+        # tip" using whatever probe ratio is already configured - setting
+        # them before :CHANnel:PROBe applies them against a stale ratio and
+        # silently leaves the actual digitized range off by the probe
+        # factor, even though readback afterward looks correct.
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.configure_for_cycle(ScopeSettings())
+
+        probe_index = rm.inst.commands.index(":CHANnel1:PROBe 10")
+        for cmd in (":CHANnel1:SCALe 50.0", ":CHANnel1:OFFSet 0.0"):
+            self.assertGreater(
+                rm.inst.commands.index(cmd),
+                probe_index,
+                f"{cmd} must be sent after :CHANnel1:PROBe",
+            )
+
     def test_timeout_diagnostics_captures_operation_condition_and_settings(self) -> None:
         rm = _FakeRM()
         rm.inst.run_bit_sequence = [0]

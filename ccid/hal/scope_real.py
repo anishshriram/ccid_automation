@@ -156,10 +156,16 @@ class ScopeReal(ScopeInterface):
         commands = [
             f":TIMebase:SCALe {settings.timebase_scale_s_per_div}",
             f":TIMebase:REFerence {settings.timebase_reference}",
+            # :CHANnel:PROBe must be set before :CHANnel:SCALe/:OFFSet - those
+            # are interpreted "at the probe tip" using whatever probe ratio is
+            # already configured, so setting them first applies against a
+            # stale ratio and only gets silently reinterpreted once :PROBe
+            # lands - readback looks correct while the actual digitized
+            # range is off by the probe factor.
+            f":CHANnel1:PROBe {settings.channel1_probe_ratio}",
             f":CHANnel1:SCALe {settings.channel1_scale_v_per_div}",
             f":CHANnel1:OFFSet {settings.channel1_offset_v}",
             f":CHANnel1:COUPling {settings.channel1_coupling}",
-            f":CHANnel1:PROBe {settings.channel1_probe_ratio}",
             f":TRIGger:SWEep {settings.trigger_sweep}",
             # :TRIGger:EDGE:* parameters are inert unless :TRIGger:MODE is
             # explicitly EDGE - the scope keeps triggering on whatever mode

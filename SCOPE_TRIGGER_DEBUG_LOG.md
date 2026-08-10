@@ -10,9 +10,16 @@ up to date rather than buried at the bottom.
 
 ## Current status (as of 2026-08-10)
 
-**Not solved.** Root cause of the no-trigger condition is still unknown.
-Two things have been ruled out (trigger mode, and previously: AC coupling,
-centered timebase, STOP verification, double-arm-check).
+**Not solved, but a strong new candidate root cause was found and fixed
+(Entry 7) via code review rather than another live trial: `:CHANnel1:PROBe`
+was being sent *after* `:CHANnel1:SCALe`/`:OFFSet` in `configure_for_cycle`.
+On Keysight scopes, scale/offset are interpreted "at the probe tip" using
+whatever probe ratio is already active - setting them first applies them
+against a stale ratio, silently leaving the actual digitized range off by
+the probe factor while every readback still looks correct. This is
+untested against real hardware.** Two other things have been ruled out
+(trigger mode, and previously: AC coupling, centered timebase, STOP
+verification, double-arm-check).
 
 The first version of timeout diagnostics capture (Entry 2) wedged the real
 scope's USBTMC interface badly enough to require a physical AC power cycle
@@ -204,6 +211,24 @@ Fixed by removing the threading approach entirely:
 - `:WAVeform:POINts?` - the query that stalled - was removed from the diagnostics query list. It isn't essential (`waveform_points_mode`/`waveform_format`/`waveform_source` already describe the waveform subsystem configuration) and isn't worth the risk of being the one query that destabilizes the transport again.
 
 Safe-off ordering, the total time budget, and the primary halt reason are all unchanged. New tests: `test_timeout_diagnostics_sets_native_visa_timeout_before_queries`, `test_timeout_diagnostics_marks_connection_unusable_after_query_failure`, `test_timeout_diagnostics_does_not_mark_connection_unusable_on_success`, and directly answering the requirement to prove no background operation survives a call - `test_timeout_diagnostics_spawns_no_background_threads` and `test_timeout_diagnostics_spawns_no_background_threads_on_failure`, both asserting `threading.active_count()` is unchanged before/after (success and failure cases). Full suite: 302 tests, OK, same 2 intentional skips. **Not yet tested against real hardware.**
+
+---
+
+## Entry 7 - 2026-08-10 - Code review found a channel probe-ratio ordering bug (untested)
+
+**What was tried:** A focused code review of the scope acquisition state machine (`ScopeReal.configure_for_cycle`/`arm_single`/`wait_until_armed`/`wait_until_acquisition_complete`/`_run_bit_set` and the sequencer's `_poll_scope_armed`/`_poll_acquisition_with_backstop`), asked directly: is something in this logic causing the no-trigger condition, not another live trial.
+
+**Result:** `configure_for_cycle` sent `:CHANnel1:SCALe`/`:CHANnel1:OFFSet` before `:CHANnel1:PROBe`. On Keysight scopes, scale/offset are interpreted "at the probe tip" using whatever probe ratio is already active at the time they're sent - so every cycle's `50 V/div` was being applied against a stale probe ratio (possibly `1x` left over from a prior session), then silently reinterpreted once `:CHANnel1:PROBe 10` landed a few commands later. `:CHANnel1:SCALe?` would still read back `50.0` afterward - this bug is invisible to a settings readback, and invisible to `ScopeSim`, which doesn't model probe-ratio-to-scale physics at all.
+
+**Commit:** (pending)
+
+**What this tells us:** This is a strong, internally-consistent candidate for the actual root cause, not just another ruled-out setting:
+- A real burst reinterpreted through a stale probe ratio could appear as only a fraction of its true voltage in the scope's actual digitized range - consistent with the flat/near-invisible trace in the most recent screenshot and the earlier "no visible CH1 waveform" observations with K1/K2 only.
+- It explains why the trigger never fires at +20 V even though the physical signal is clearly present (EVSE faults red).
+- It explains why manual front-panel Single presses worked and automated cycles never did: front-panel operation is stateful (probe ratio already correct from a prior session), while `configure_for_cycle()` reconfigures from scratch every cycle, hitting the ordering bug every time.
+- It explains why 300+ passing tests never caught this: the simulator has no equivalent physics to get wrong.
+
+Fixed: `:CHANnel1:PROBe` now sent first, before `:CHANnel1:SCALe`/`:CHANnel1:OFFSet`/`:CHANnel1:COUPling`. New regression test: `test_configure_sets_probe_ratio_before_scale_and_offset`. **Not yet tested against real hardware** - this is a hypothesis based on documented SCPI scope programming convention, not a confirmed fix. The next real dry run (once diagnostics capture is itself confirmed safe per Entry 6) is what actually tests it.
 
 ---
 
