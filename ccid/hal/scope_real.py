@@ -34,7 +34,6 @@ _DIAGNOSTIC_SETTINGS_QUERIES: tuple[tuple[str, str], ...] = (
     ("trigger_mode", ":TRIGger:MODE?"),
     ("trigger_sweep", ":TRIGger:SWEep?"),
     ("trigger_coupling", ":TRIGger:COUPling?"),
-    ("trigger_noise_reject", ":TRIGger:NREJect?"),
     ("trigger_edge_source", ":TRIGger:EDGE:SOURce?"),
     ("trigger_edge_slope", ":TRIGger:EDGE:SLOPe?"),
     ("trigger_edge_level", ":TRIGger:EDGE:LEVel?"),
@@ -55,6 +54,7 @@ _DIAGNOSTIC_SETTINGS_QUERIES: tuple[tuple[str, str], ...] = (
 )
 
 _DIAGNOSTIC_ERROR_QUEUE_MAX_READS = 20
+_CONFIG_ERROR_QUEUE_MAX_DRAIN = 20
 
 # PyVISA-Py raises this for `.clear()` on backends/resource types that don't
 # implement a device clear at all (confirmed on a real de-energized dry
@@ -67,6 +67,12 @@ _VI_ERROR_NSUP_OPER_MARKER = "VI_ERROR_NSUP_OPER"
 
 class ScopeRealError(HardwareInterfaceError):
     pass
+
+
+class ScopeConfigurationError(ScopeRealError):
+    """Raised when the scope rejects one or more configuration commands
+    (nonzero SCPI error queue after `*OPC?`). Must halt the cycle before
+    arming or K3 injection - never silently absorbed."""
 
 
 def _as_float(text: str) -> float:
@@ -184,12 +190,9 @@ class ScopeReal(ScopeInterface):
             # Trigger coupling is a separate path from channel1_coupling -
             # it controls what the trigger comparator sees, not what gets
             # digitized. Explicit, not left at whatever the front panel had.
+            # Confirmed on real hardware: this command is supported and
+            # reads back correctly (see SCOPE_TRIGGER_DEBUG_LOG.md Entry 9).
             f":TRIGger:COUPling {settings.trigger_coupling}",
-            # Noise reject adds comparator hysteresis around the trigger
-            # level, raising the effective threshold above the configured
-            # value - never wanted for a one-shot transient against a fixed
-            # level, so this is locked off rather than made configurable.
-            ":TRIGger:NREJect OFF",
             f":TRIGger:EDGE:SOURce {settings.trigger_source}",
             f":TRIGger:EDGE:LEVel {settings.trigger_level_v}",
             f":TRIGger:EDGE:SLOPe {settings.trigger_slope}",
@@ -207,7 +210,33 @@ class ScopeReal(ScopeInterface):
         # this method returns) could race ahead of the scope still
         # internalizing the last few config commands.
         self._query("*OPC?")
+
+        # A rejected configuration command (SCPI error, e.g. -113 "Undefined
+        # header" for a command this instrument doesn't recognize) must halt
+        # the cycle here, not be silently absorbed - proceeding to arm/inject
+        # against a configuration the scope only partially applied is a
+        # bigger risk than halting a cycle. Raising here relies on the
+        # sequencer's existing exception handling: `_attempt_cycle` calls
+        # `arm_single()`/`close_k3()` only after this method returns
+        # normally, so an exception raised here reaches the run loop before
+        # either can happen, and `Sequencer.run()`'s `finally` still opens
+        # K1/K2 via `safe_off()` regardless.
+        config_errors = self._drain_configuration_errors()
+        if config_errors:
+            raise ScopeConfigurationError(
+                f"Scope rejected {len(config_errors)} configuration command(s): "
+                + "; ".join(config_errors)
+            )
         self._status = ScopeStatus.CONFIGURED
+
+    def _drain_configuration_errors(self) -> tuple[str, ...]:
+        errors: list[str] = []
+        for _ in range(_CONFIG_ERROR_QUEUE_MAX_DRAIN):
+            response = self._query(":SYSTem:ERRor?")
+            if response.startswith("+0,"):
+                break
+            errors.append(response)
+        return tuple(errors)
 
     def readback_settings(self) -> Mapping[str, str]:
         self._require_connected()

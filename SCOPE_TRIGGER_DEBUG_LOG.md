@@ -10,7 +10,22 @@ up to date rather than buried at the bottom.
 
 ## Current status (as of 2026-08-10)
 
-**Not solved.** Entry 7's probe-ratio-ordering fix was tried on a real
+**Not solved.** A clean, de-energized `configure --real` check of Entry 8's
+changes found `-113,"Undefined header"` in the scope's error queue.
+`:TRIGger:NREJect` was confirmed (via real hardware testing) to be the
+unsupported command on this MSO-X 2014A; `:TRIGger:COUPling` was confirmed
+supported and reads back correctly as `DC`. An interim fix (now reverted)
+had drained and *discarded* any configuration error to keep cycles
+running - Entry 9 corrects that: an unsupported/rejected configuration
+command must **block the cycle**, not be silently absorbed. `:TRIGger:NREJect
+OFF` is removed entirely; `configure_for_cycle` now raises
+`ScopeConfigurationError` if the error queue is nonzero after `*OPC?`,
+which (via the sequencer's existing exception handling) halts the cycle
+before `arm_single()`/`close_k3()` can ever be called. **Untested against
+real hardware** - the next `configure --real` check should now come back
+clean with no error and no exception.
+
+Entry 7's probe-ratio-ordering fix was tried on a real
 energized cycle (Entry 8) and did **not** fix it - channel/trigger-edge
 settings all read back exactly as configured (trigger mode EDGE, source
 CHAN1, positive slope, +20V, probe 10x, scale 50V/div, AC channel
@@ -262,7 +277,24 @@ Addressed both, plus a related synchronization gap noticed during the review - `
 - `*OPC?` synchronization barrier added at the end of `configure_for_cycle`, before returning - blocks until every queued command has actually finished executing, not just been sent.
 - `:TRIGger:COUPling?`, `:TRIGger:NREJect?`, and `:TER?` (trigger event register - a top-level status register, separate from the operation condition register, that directly answers "has a trigger event occurred" independent of whether acquisition ever reached Stop) added to the timeout-diagnostics query list.
 
-New tests: `test_configure_sets_trigger_coupling_dc_and_disables_noise_reject`, `test_configure_sends_opc_sync_barrier_after_commands`, plus diagnostics assertions for the three new settings keys. Full suite: 305 tests, OK, same 2 intentional skips. **Not yet tested against real hardware.**
+New tests: `test_configure_sets_trigger_coupling_dc_and_disables_noise_reject`, `test_configure_sends_opc_sync_barrier_after_commands`, plus diagnostics assertions for the three new settings keys. Full suite: 305 tests, OK, same 2 intentional skips.
+
+---
+
+## Entry 9 - 2026-08-10 - Rejected configuration commands must block the cycle, not be silently absorbed
+
+**What was tried:** A `configure --real` check of Entry 8 found `-113,"Undefined header"` in the error queue. Rather than guess which of the two new trigger commands was unsupported, an interim fix (commit `99b8e37`) had the scope drain and discard any configuration error, treating it as non-fatal so cycles could keep running regardless of which command was bad. The operator then determined via direct real-hardware testing which command was actually the problem: `:TRIGger:NREJect` is unsupported on this MSO-X 2014A (confirmed unsupported), `:TRIGger:COUPling` is supported and reads back correctly as `DC` (confirmed working).
+
+**Commit:** (pending)
+
+**What this tells us:** Discarding configuration errors was the wrong default, not just an imprecise one - reverted (commit `99b8e37` reverted via `git revert`). If a scope rejects any configuration command, the resulting state is only partially known: proceeding to arm and inject leakage current against a configuration that wasn't fully applied is a bigger risk than halting the cycle. Corrected:
+
+- `:TRIGger:NREJect OFF` removed from `configure_for_cycle` entirely - not made conditional, not retried, just not sent, since it's confirmed unsupported on this instrument.
+- `:TRIGger:COUPling {trigger_coupling}` kept as-is (confirmed working).
+- `:TRIGger:NREJect?` removed from the timeout-diagnostics query list (querying a confirmed-unsupported command wastes a diagnostics slot for no benefit).
+- After `*OPC?`, `configure_for_cycle` now drains the error queue into a bounded list (`_drain_configuration_errors`, same 20-read bound as elsewhere) and, if it's nonempty, raises a new `ScopeConfigurationError` naming every rejected command. This relies on the sequencer's existing exception handling - `_attempt_cycle` only calls `arm_single()`/`close_k3()` after `configure_for_cycle()` returns normally, so the exception reaches the run loop before either can happen, and `Sequencer.run()`'s `finally` still opens K1/K2 via `safe_off()` regardless. No sequencer changes were needed - the existing `CcidError` halt path already does exactly the right thing.
+
+New tests: `test_configure_raises_when_scope_rejects_a_configuration_command`, `test_configure_raises_with_all_rejected_commands_listed`, `test_configure_error_drain_is_bounded_and_still_raises`, `test_configure_does_not_raise_when_error_queue_is_clean` (`test_scope_real.py`), and `test_rejected_configuration_command_blocks_arming_and_k3_injection` (`test_sequencer.py`) - the last one is the test that actually proves the safety property: a scope whose `configure_for_cycle` raises never gets `close_k3` called, and K1/K2/K3 all end up open. Full suite: 310 tests, OK, same 2 intentional skips. **Not yet tested against real hardware** - the next `configure --real` check should come back clean with no error and no exception raised.
 
 ---
 

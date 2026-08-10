@@ -5,7 +5,7 @@ import threading
 import unittest
 
 from ccid.hal.base import ScopeSettings, ScopeStatus
-from ccid.hal.scope_real import ScopeReal, _parse_keysight_preamble
+from ccid.hal.scope_real import ScopeConfigurationError, ScopeReal, _parse_keysight_preamble
 
 
 class _FakeInstrument:
@@ -17,6 +17,7 @@ class _FakeInstrument:
         self.run_bit_sequence = [8, 8, 0]
         self.fail_commands: set[str] = set()
         self.always_error_queue = False
+        self.error_queue_seed: list[str] = []
         self._error_queue_calls = 0
         self.fail_png = False
         self.fail_clear = False
@@ -42,6 +43,8 @@ class _FakeInstrument:
                 return str(self.run_bit_sequence.pop(0))
             return "0"
         if command == ":SYSTem:ERRor?":
+            if self.error_queue_seed:
+                return self.error_queue_seed.pop(0)
             if self.always_error_queue:
                 self._error_queue_calls += 1
                 return f'-{self._error_queue_calls},"Simulated error {self._error_queue_calls}"'
@@ -53,7 +56,6 @@ class _FakeInstrument:
             ":TRIGger:MODE?": "EDGE",
             ":TRIGger:SWEep?": "NORMal",
             ":TRIGger:COUPling?": "DC",
-            ":TRIGger:NREJect?": "0",
             ":TER?": "0",
             ":TRIGger:EDGE:SOURce?": "CHAN1",
             ":TRIGger:EDGE:SLOPe?": "POS",
@@ -219,11 +221,13 @@ class ScopeRealTests(unittest.TestCase):
                 f"{cmd} must be sent after :CHANnel1:PROBe",
             )
 
-    def test_configure_sets_trigger_coupling_dc_and_disables_noise_reject(self) -> None:
+    def test_configure_sets_trigger_coupling_dc(self) -> None:
         # DC, not AC: the trigger comparator must see the raw absolute
-        # voltage for a one-shot transient against a fixed level. Noise
-        # reject is locked off since it adds comparator hysteresis, raising
-        # the effective threshold above the configured level.
+        # voltage for a one-shot transient against a fixed level. (Trigger
+        # noise reject was also tried but is not supported on this
+        # instrument - confirmed real hardware returned -113 "Undefined
+        # header" - and was removed rather than left unconditionally sent;
+        # see SCOPE_TRIGGER_DEBUG_LOG.md Entry 9.)
         rm = _FakeRM()
         rm.inst.run_bit_sequence = [0]
         scope = ScopeReal(
@@ -236,7 +240,7 @@ class ScopeRealTests(unittest.TestCase):
         scope.configure_for_cycle(ScopeSettings())
 
         self.assertIn(":TRIGger:COUPling DC", rm.inst.commands)
-        self.assertIn(":TRIGger:NREJect OFF", rm.inst.commands)
+        self.assertNotIn(":TRIGger:NREJect OFF", rm.inst.commands)
 
     def test_configure_sends_opc_sync_barrier_after_commands(self) -> None:
         # arm_single() is called immediately after configure_for_cycle()
@@ -259,6 +263,75 @@ class ScopeRealTests(unittest.TestCase):
         # full command list, not interleaved with it.
         self.assertEqual(rm.inst.commands[-1], ":WAVeform:POINts:MODE RAW")
 
+    def test_configure_raises_when_scope_rejects_a_configuration_command(self) -> None:
+        # A rejected command (e.g. -113 "Undefined header") must halt the
+        # cycle, not be silently absorbed - proceeding to arm/inject against
+        # a configuration the scope only partially applied is a bigger risk
+        # than halting. See SCOPE_TRIGGER_DEBUG_LOG.md Entry 9.
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        rm.inst.error_queue_seed = ['-113,"Undefined header"']
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        with self.assertRaises(ScopeConfigurationError) as ctx:
+            scope.configure_for_cycle(ScopeSettings())
+
+        self.assertIn("Undefined header", str(ctx.exception))
+        self.assertNotEqual(scope.status(), ScopeStatus.CONFIGURED)
+
+    def test_configure_raises_with_all_rejected_commands_listed(self) -> None:
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        rm.inst.error_queue_seed = [
+            '-113,"Undefined header"',
+            '-222,"Data out of range"',
+        ]
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        with self.assertRaises(ScopeConfigurationError) as ctx:
+            scope.configure_for_cycle(ScopeSettings())
+
+        self.assertIn("Undefined header", str(ctx.exception))
+        self.assertIn("Data out of range", str(ctx.exception))
+
+    def test_configure_error_drain_is_bounded_and_still_raises(self) -> None:
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        rm.inst.always_error_queue = True  # never returns "+0,..." on its own
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        with self.assertRaises(ScopeConfigurationError):
+            scope.configure_for_cycle(ScopeSettings())  # must return/raise, not loop forever
+
+    def test_configure_does_not_raise_when_error_queue_is_clean(self) -> None:
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.configure_for_cycle(ScopeSettings())  # must not raise
+
+        self.assertEqual(scope.status(), ScopeStatus.CONFIGURED)
+
     def test_timeout_diagnostics_captures_operation_condition_and_settings(self) -> None:
         rm = _FakeRM()
         rm.inst.run_bit_sequence = [0]
@@ -275,7 +348,6 @@ class ScopeRealTests(unittest.TestCase):
         self.assertEqual(diagnostics.settings["trigger_mode"], "EDGE")
         self.assertEqual(diagnostics.settings["ch1_coupling"], "AC")
         self.assertEqual(diagnostics.settings["trigger_coupling"], "DC")
-        self.assertEqual(diagnostics.settings["trigger_noise_reject"], "0")
         self.assertEqual(diagnostics.settings["trigger_event_register"], "0")
         self.assertEqual(diagnostics.error_queue, ())
         self.assertTrue(diagnostics.scope_png.startswith(b"\x89PNG"))

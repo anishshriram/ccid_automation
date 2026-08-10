@@ -13,6 +13,7 @@ from ccid.classify import LedColor, frames_to_bgr_bytes, make_led_frame
 from ccid.config import AppConfig, TimingConfig, VisionConfig, load_config
 from ccid.hal.base import CameraFrame, CameraHealth, CameraStateSample, ContactorName, ScopeTimeoutDiagnostics
 from ccid.hal.gpio_sim import GpioSimContactorController
+from ccid.hal.scope_real import ScopeConfigurationError
 from ccid.hal.scope_sim import ScopeSim, ScopeSimScenario
 from ccid.recorder import RunRecorder
 from ccid.sequencer import FaultCategory, Sequencer
@@ -158,6 +159,17 @@ class _RecordingDiagnosticsScope(ScopeSim):
     def capture_timeout_diagnostics(self) -> ScopeTimeoutDiagnostics:
         self.commanded_closed_at_diagnostics_time = dict(self._contactors.snapshot().commanded_closed)
         return super().capture_timeout_diagnostics()
+
+
+class _ConfigFailureScope(ScopeSim):
+    """Scope whose configure_for_cycle always raises, as ScopeReal now does
+    when the instrument rejects a configuration command
+    (SCOPE_TRIGGER_DEBUG_LOG.md Entry 9) - proves the cycle halts before
+    arming or closing K3 rather than proceeding on a partially-applied
+    configuration."""
+
+    def configure_for_cycle(self, settings) -> None:
+        raise ScopeConfigurationError("simulated rejected configuration command")
 
 
 class _TwoHueCamera:
@@ -471,6 +483,33 @@ class SequencerTests(unittest.TestCase):
         self.assertFalse(scope.commanded_closed_at_diagnostics_time[ContactorName.K1])
         self.assertFalse(scope.commanded_closed_at_diagnostics_time[ContactorName.K2])
         self.assertFalse(scope.commanded_closed_at_diagnostics_time[ContactorName.K3])
+
+    def test_rejected_configuration_command_blocks_arming_and_k3_injection(self) -> None:
+        # A scope that rejects a configuration command (ScopeReal now raises
+        # ScopeConfigurationError in that case - Entry 9) must halt the
+        # cycle before arm_single()/close_k3() can ever be called, not
+        # proceed on a partially-applied configuration.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scope = _ConfigFailureScope(scenario=self._scope_scenario(), monotonic_now=self.clock.now)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(),
+            contactors=contactors,
+            scope=scope,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.HALTED)
+        self.assertIn("ScopeConfigurationError", result.halt_reason or "")
+        operations = [event.operation for event in contactors.events()]
+        self.assertNotIn("close_k3", operations)
+        snapshot = contactors.snapshot().commanded_closed
+        self.assertFalse(snapshot[ContactorName.K1])
+        self.assertFalse(snapshot[ContactorName.K2])
+        self.assertFalse(snapshot[ContactorName.K3])
 
     def test_scope_consumed_before_injection_never_closes_k3(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)
