@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import time
+import threading
 import unittest
 
 from ccid.hal.base import ScopeSettings, ScopeStatus
@@ -12,9 +12,9 @@ class _FakeInstrument:
     def __init__(self) -> None:
         self.commands: list[str] = []
         self.closed = False
+        self.timeout = 2000  # ms - PyVISA-style native per-resource timeout
         self.run_bit_sequence = [8, 8, 0]
         self.fail_commands: set[str] = set()
-        self.slow_commands: dict[str, float] = {}
         self.always_error_queue = False
         self._error_queue_calls = 0
         self.fail_png = False
@@ -31,8 +31,6 @@ class _FakeInstrument:
             raise TimeoutError(self.clear_error_text)
 
     def query(self, command: str) -> str:
-        if command in self.slow_commands:
-            time.sleep(self.slow_commands[command])
         if command in self.fail_commands:
             raise TimeoutError(f"simulated VISA timeout for {command}")
         if command == "*IDN?":
@@ -300,23 +298,98 @@ class ScopeRealTests(unittest.TestCase):
         self.assertEqual(diagnostics.operation_condition, 0)
         self.assertTrue(diagnostics.scope_png.startswith(b"\x89PNG"))
 
-    def test_timeout_diagnostics_enforces_hard_per_query_timeout(self) -> None:
+    def test_timeout_diagnostics_sets_native_visa_timeout_before_queries(self) -> None:
+        # No supervising thread anymore (see SCOPE_TRIGGER_DEBUG_LOG.md
+        # Entry 6) - the per-query bound now comes entirely from PyVISA's
+        # own native per-resource `.timeout`, set synchronously before any
+        # query is issued.
         rm = _FakeRM()
-        rm.inst.slow_commands = {":CHANnel1:COUPling?": 2.0}
         scope = ScopeReal(
             resource="USB::FAKE",
             monotonic_now=lambda: 5.0,
             resource_manager_factory=lambda backend: rm,
-            diagnostics_query_timeout_s=0.05,
+            diagnostics_query_timeout_s=0.25,
         )
         scope.connect()
 
-        started = time.monotonic()
-        diagnostics = scope.capture_timeout_diagnostics()
-        elapsed = time.monotonic() - started
+        scope.capture_timeout_diagnostics()
 
-        self.assertLess(elapsed, 1.0)  # bounded by the 0.05s timeout, not the 2.0s sleep
-        self.assertIn("timed out", str(diagnostics.settings["ch1_coupling"]))
+        self.assertEqual(rm.inst.timeout, 250.0)
+
+    def test_timeout_diagnostics_spawns_no_background_threads(self) -> None:
+        # Regression for SCOPE_TRIGGER_DEBUG_LOG.md Entry 6: a prior
+        # daemon-thread-based timeout gave up waiting on a slow query but
+        # left the thread running in the background, still touching the
+        # connection - racing with the main thread and segfaulting the
+        # process. Every query must now be synchronous, in this thread,
+        # with nothing left running afterward, whether it succeeds or fails.
+        rm = _FakeRM()
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+        threads_before = threading.active_count()
+
+        scope.capture_timeout_diagnostics()
+
+        self.assertEqual(threading.active_count(), threads_before)
+
+    def test_timeout_diagnostics_spawns_no_background_threads_on_failure(self) -> None:
+        rm = _FakeRM()
+        rm.inst.fail_commands = {":CHANnel1:COUPling?"}
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+        threads_before = threading.active_count()
+
+        scope.capture_timeout_diagnostics()
+
+        self.assertEqual(threading.active_count(), threads_before)
+
+    def test_timeout_diagnostics_marks_connection_unusable_after_query_failure(self) -> None:
+        # Once a query fails, the transport's state can't be trusted (Entry
+        # 3) - no further operation, including a later disconnect()'s
+        # .close(), should touch this connection.
+        rm = _FakeRM()
+        rm.inst.fail_commands = {":CHANnel1:COUPling?"}
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.capture_timeout_diagnostics()
+
+        with self.assertRaises(Exception):
+            scope.identify()
+
+        scope.disconnect()
+        self.assertFalse(rm.inst.closed)  # no operation issued against the poisoned connection
+
+        with self.assertRaises(Exception):
+            scope.connect()
+
+    def test_timeout_diagnostics_does_not_mark_connection_unusable_on_success(self) -> None:
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.capture_timeout_diagnostics()
+
+        self.assertIn("FAKE_SCOPE", scope.identify())  # still usable
+        scope.disconnect()
+        self.assertTrue(rm.inst.closed)  # normal disconnect still closes the resource
 
     def test_timeout_diagnostics_respects_total_time_budget(self) -> None:
         rm = _FakeRM()

@@ -22,15 +22,24 @@ fail-fast-on-first-failure, and a device-clear-first step.
 
 That corrective version was dry-run against the real scope (Entry 5): it
 completed in 0.001s without wedging anything, and `*IDN?` still worked
-afterward - the sequencing/timeout fix works. The only issue found was
-that PyVISA-Py doesn't implement `.clear()` on this backend
-(`VI_ERROR_NSUP_OPER`), which the fail-fast logic was treating as "abort
-everything," so diagnostics never even reached the queries. Fixed in
-Entry 5 to specifically recognize that error as "clear unsupported" and
-proceed anyway. **That specific fix has not yet been re-run against real
-hardware** - the next dry run should confirm diagnostics now actually
-populates settings/error-queue/screenshot instead of stopping at the
-clear step.
+afterward - the sequencing fix works. The `.clear()` handling was then
+fixed for `VI_ERROR_NSUP_OPER` (Entry 5) and dry-run again (Entry 6).
+
+**Entry 6 found a serious flaw in the timeout mechanism itself**, not the
+sequencing: the daemon-thread-based per-query timeout gave up waiting on a
+slow `:WAVeform:POINts?` query, but the abandoned thread stayed blocked
+inside libusb - and when the main thread went on to touch the same
+connection afterward, the two threads raced and the process **segfaulted**.
+The scope needed another full AC-power-removal to recover. The
+thread-based timeout design has been removed entirely and replaced with
+PyVISA's native, synchronous per-resource `.timeout` (no thread involved -
+the bound is enforced by the transport call itself, not by Python giving
+up on waiting for it). `:WAVeform:POINts?` was also dropped from the
+diagnostics query list entirely (nonessential, and the one query that was
+slow). **This redesign has not yet been tested against real hardware** -
+that is the next required dry run, and per the operator's explicit
+instruction, no further real-scope test should happen until it's confirmed
+no background VISA operation can ever outlive a timed-out call.
 
 ---
 
@@ -171,9 +180,30 @@ A true cold restart of the oscilloscope, including removing its AC power for 60 
 
 **Result:** Completed in 0.001s - no wedging, no hang. `self._inst.clear()` raised `VI_ERROR_NSUP_OPER` (PyVISA-Py does not implement device clear on this backend/resource type). Because the fail-fast logic treated *any* clear failure as grounds to abort, diagnostics stopped immediately without sending a single query. A subsequent `*IDN?` succeeded, confirming the scope's communication stayed healthy throughout - unlike Entry 3, nothing was left in a bad state.
 
+**Commit:** `fc9d799`
+
+**What this tells us:** The sequencing fix (diagnostics after full safe-off) held up - the 0.001s completion time and healthy post-run `*IDN?` are real evidence of that. **Correction, added after Entry 6:** the claim below that "the hard-timeout mechanism holds up on real hardware" was premature - this run aborted at the `.clear()` step before a single query was attempted, so the per-query timeout was never actually exercised here. It was exercised for the first time in Entry 6, and that is what segfaulted the process. Treat this entry as confirming the sequencing fix only.
+
+Fixed here: `VI_ERROR_NSUP_OPER` specifically is now recorded in `settings["device_clear"]` and diagnostics proceeds to the normal bounded, fail-fast queries; every other clear failure still aborts immediately as before. New regression test: `test_timeout_diagnostics_continues_when_device_clear_unsupported`.
+
+---
+
+## Entry 6 - 2026-08-10 - Real dry run segfaulted: daemon-thread timeout raced with the main thread and crashed the process
+
+**What was tried:** A real de-energized dry run of the Entry 5 diagnostics implementation (with the `VI_ERROR_NSUP_OPER` fix) against the physical MSO-X 2014A.
+
+**Result:** Most diagnostic queries succeeded, but `:WAVeform:POINts?` exceeded the 1.0s daemon-thread timeout. `_run_with_timeout()` gave up waiting and returned - but the thread it had spawned was still blocked inside libusb, and kept running in the background. During disconnect or interpreter cleanup, libusb printed `[libusb_open] open 0.0` and Python crashed with a **segmentation fault**. The scope's USBTMC interface again required a full AC-power removal to recover.
+
 **Commit:** (pending)
 
-**What this tells us:** The sequencing fix (diagnostics after full safe-off) and the hard-timeout mechanism both hold up on real hardware - the 0.001s completion time and healthy post-run `*IDN?` are exactly what Entry 4 needed to confirm. The only defect was treating "clear not supported by this backend" the same as "clear failed because the connection is unhealthy," which are not the same thing. Fixed: `VI_ERROR_NSUP_OPER` specifically is now recorded in `settings["device_clear"]` and diagnostics proceeds to the normal bounded, fail-fast queries; every other clear failure still aborts immediately as before. Safe-off ordering, per-query timeout, total deadline, and the primary halt reason were all left unchanged. New regression test: `test_timeout_diagnostics_continues_when_device_clear_unsupported`. Not yet re-verified against real hardware - the next dry run should confirm diagnostics actually reaches and populates the settings/error-queue/screenshot fields now, not just that it stops cleanly at the clear step.
+**What this tells us:** The daemon-thread-based timeout design (Entry 4) was fundamentally unsafe, not just imperfect: giving up on waiting for a call from a supervising thread does not stop the call - the real libusb operation kept running unbounded in the background, and letting the main thread proceed to touch the same PyVISA session (including eventual `disconnect()`) while that background operation might still be in flight is a genuine data race at the C-library level, which is what produced the segfault, not just a hang.
+
+Fixed by removing the threading approach entirely:
+- Every diagnostics query is now synchronous, in the same thread, bounded by PyVISA's own native per-resource `.timeout` (set once, in milliseconds, before any query) - the actual transport call is what gets bounded, at the libusb/kernel level, not just how long our Python code waits for it.
+- On any query failure, the connection is marked permanently unusable for the rest of the process (`self._connection_unusable`): `connect()` refuses to reconnect, `disconnect()` skips `.close()` entirely and just drops the references, and `_require_connected()` (used by every other real-driver method) raises immediately. Nothing touches a connection whose transport state can't be trusted again.
+- `:WAVeform:POINts?` - the query that stalled - was removed from the diagnostics query list. It isn't essential (`waveform_points_mode`/`waveform_format`/`waveform_source` already describe the waveform subsystem configuration) and isn't worth the risk of being the one query that destabilizes the transport again.
+
+Safe-off ordering, the total time budget, and the primary halt reason are all unchanged. New tests: `test_timeout_diagnostics_sets_native_visa_timeout_before_queries`, `test_timeout_diagnostics_marks_connection_unusable_after_query_failure`, `test_timeout_diagnostics_does_not_mark_connection_unusable_on_success`, and directly answering the requirement to prove no background operation survives a call - `test_timeout_diagnostics_spawns_no_background_threads` and `test_timeout_diagnostics_spawns_no_background_threads_on_failure`, both asserting `threading.active_count()` is unchanged before/after (success and failure cases). Full suite: 302 tests, OK, same 2 intentional skips. **Not yet tested against real hardware.**
 
 ---
 
