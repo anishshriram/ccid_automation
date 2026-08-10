@@ -55,7 +55,6 @@ _DIAGNOSTIC_SETTINGS_QUERIES: tuple[tuple[str, str], ...] = (
 )
 
 _DIAGNOSTIC_ERROR_QUEUE_MAX_READS = 20
-_CONFIG_ERROR_QUEUE_MAX_DRAIN = 20
 
 # PyVISA-Py raises this for `.clear()` on backends/resource types that don't
 # implement a device clear at all (confirmed on a real de-energized dry
@@ -208,24 +207,7 @@ class ScopeReal(ScopeInterface):
         # this method returns) could race ahead of the scope still
         # internalizing the last few config commands.
         self._query("*OPC?")
-        self._drain_configuration_errors()
         self._status = ScopeStatus.CONFIGURED
-
-    def _drain_configuration_errors(self) -> None:
-        """Best-effort: not every configuration command is supported on
-        every instrument model/firmware (confirmed on real hardware - a
-        clean `configure --real` left `-113,"Undefined header"` in the
-        error queue, most likely from :TRIGger:COUPling or
-        :TRIGger:NREJect; some InfiniiVision models don't expose a
-        trigger-path coupling distinct from channel coupling at all). An
-        unsupported optional/refinement command must not halt a cycle, and
-        must not leave a stale error sitting in the queue where a later
-        timeout's diagnostics capture would misreport it as relevant to
-        that later failure - so anything left behind by configuration is
-        drained here and discarded, not treated as fatal."""
-        for _ in range(_CONFIG_ERROR_QUEUE_MAX_DRAIN):
-            if self._query(":SYSTem:ERRor?").startswith("+0,"):
-                return
 
     def readback_settings(self) -> Mapping[str, str]:
         self._require_connected()
