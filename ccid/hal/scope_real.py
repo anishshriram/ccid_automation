@@ -280,6 +280,10 @@ class ScopeReal(ScopeInterface):
             time.sleep(0.01)
         return False
 
+    def read_trigger_event_register(self) -> bool:
+        self._require_connected()
+        return int(float(self._query(":TER?"))) != 0
+
     def capture_after_acquire(self) -> WaveformCapture:
         self._require_connected()
         samples = self._query_binary(":WAVeform:DATA?")

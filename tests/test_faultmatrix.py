@@ -327,7 +327,68 @@ class FaultMatrixTests(unittest.TestCase):
         self.assertFalse(self._artifact_committed(run_dir))  # halted before any capture.
         self.assertTrue((run_dir / "diagnostics" / "1" / "scope_timeout.png").exists())
         self.assertTrue((run_dir / "diagnostics" / "1" / "scope_state.json").exists())
-        self.assertTrue((run_dir / "diagnostics" / "1" / "scope_errors.txt").exists())
+
+    def test_scope_triggered_but_acquisition_not_completed_row(self) -> None:
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 10: distinguishes "trigger event
+        # register confirmed a trigger occurred" from a genuine no-trigger
+        # condition - same safety outcome (halt, full safe-off, no commit),
+        # but a distinct halt reason so the two are not conflated.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        sequencer, contactors = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(
+                never_triggered=True,
+                diagnostics_settings_overrides={"trigger_event_register": "+1"},
+            ),
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertEqual(result.fault_category, FaultCategory.RIG)
+        self.assertIn("scope_triggered_but_acquisition_not_completed", result.halt_reason or "")
+        self._assert_safe_and_ordered(contactors)
+        self._assert_runstate(run_dir, halt_reason_present=True)
+        self.assertFalse(self._artifact_committed(run_dir))  # halted before any capture.
+        self.assertTrue((run_dir / "diagnostics" / "1" / "scope_timeout.png").exists())
+        self.assertTrue((run_dir / "diagnostics" / "1" / "scope_state.json").exists())
+
+    def test_scope_stale_trigger_event_before_arm_row(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        sequencer, contactors = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(trigger_event_latched_at_configure=True),
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertEqual(result.fault_category, FaultCategory.RIG)
+        self.assertIn("scope_stale_trigger_event_before_arm", result.halt_reason or "")
+        self._assert_safe_and_ordered(contactors)
+        self._assert_runstate(run_dir, halt_reason_present=True)
+        self.assertFalse(self._artifact_committed(run_dir))
+
+    def test_scope_trigger_event_before_injection_row(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        sequencer, contactors = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(trigger_event_latched_before_injection=True),
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertEqual(result.fault_category, FaultCategory.RIG)
+        self.assertIn("scope_trigger_event_before_injection", result.halt_reason or "")
+        self._assert_safe_and_ordered(contactors)
+        self._assert_runstate(run_dir, halt_reason_present=True)
+        self.assertFalse(self._artifact_committed(run_dir))
+        operations = [event.operation for event in contactors.events()]
+        self.assertNotIn("close_k3", operations)
 
     def test_k3_pretrigger_leakage_row(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)

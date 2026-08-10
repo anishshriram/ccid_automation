@@ -42,6 +42,12 @@ class ScopeSimScenario:
     diagnostics_settings_overrides: Mapping[str, object] = field(default_factory=dict)
     diagnostics_error_queue: tuple[str, ...] = field(default_factory=tuple)
     diagnostics_scope_png: bytes = b"\x89PNG\r\n\x1a\nSCOPE_SIM"
+    # Simulates a stale trigger-event flag already latched when
+    # configure_for_cycle completes, before arm_single is ever called.
+    trigger_event_latched_at_configure: bool = False
+    # Simulates a spurious trigger event occurring between arm_single and
+    # the deliberate K3 close (the pre-injection recheck window).
+    trigger_event_latched_before_injection: bool = False
 
 
 class ScopeSim(ScopeInterface):
@@ -60,6 +66,7 @@ class ScopeSim(ScopeInterface):
         self._arm_commanded_s: float | None = None
         self._armed_s: float | None = None
         self._acquire_started_s: float | None = None
+        self._trigger_event_latched = False
 
     def connect(self) -> None:
         self._maybe_raise("connect")
@@ -84,6 +91,7 @@ class ScopeSim(ScopeInterface):
         self._arm_commanded_s = None
         self._armed_s = None
         self._acquire_started_s = None
+        self._trigger_event_latched = self._scenario.trigger_event_latched_at_configure
 
     def readback_settings(self) -> dict[str, str]:
         self._require_connected()
@@ -102,6 +110,7 @@ class ScopeSim(ScopeInterface):
         self._maybe_raise("arm")
         self._arm_commanded_s = self._monotonic_now()
         self._status = ScopeStatus.ARMING
+        self._trigger_event_latched = self._scenario.trigger_event_latched_before_injection
 
     def wait_until_armed(self, timeout_s: float, now_monotonic_s: float) -> bool:
         self._require_connected()
@@ -140,6 +149,13 @@ class ScopeSim(ScopeInterface):
             return True
         self._status = ScopeStatus.ACQUIRING
         return False
+
+    def read_trigger_event_register(self) -> bool:
+        self._require_connected()
+        self._maybe_raise("trigger_event_register")
+        latched = self._trigger_event_latched
+        self._trigger_event_latched = False
+        return latched
 
     def capture_after_acquire(self) -> WaveformCapture:
         self._require_connected()

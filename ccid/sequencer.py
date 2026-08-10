@@ -24,7 +24,7 @@ import json
 import logging
 import shutil
 import zipfile
-from typing import Callable
+from typing import Callable, Mapping
 
 from ccid.analysis import (
     SANITY_NO_PRETRIGGER_LEAKAGE,
@@ -59,6 +59,15 @@ _LOGGER = logging.getLogger(__name__)
 # persisted `primary_halt_reason`, so the two strings can't silently drift
 # apart in a future edit.
 _SCOPE_TIMEOUT_REASON = "scope_never_triggered_or_acquire_timeout"
+
+# Distinguishes "trigger event register confirmed a trigger occurred, but
+# the acquisition subsystem never reported Stop" from a genuine no-trigger
+# condition (SCOPE_TRIGGER_DEBUG_LOG.md Entry 10) - these are different
+# failure modes and must not be collapsed into the same halt reason.
+_SCOPE_TRIGGERED_BUT_ACQUISITION_NOT_COMPLETED_REASON = "scope_triggered_but_acquisition_not_completed"
+
+_SCOPE_STALE_TRIGGER_EVENT_BEFORE_ARM_REASON = "scope_stale_trigger_event_before_arm"
+_SCOPE_TRIGGER_EVENT_BEFORE_INJECTION_REASON = "scope_trigger_event_before_injection"
 
 
 class FaultCategory(str, Enum):
@@ -402,6 +411,19 @@ class Sequencer:
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.SCOPE_CONFIGURING)
         self._scope.configure_for_cycle(self._scope_settings)
 
+        # A trigger event register already latched here means either stale
+        # state from a prior session/cycle or a spurious trigger during
+        # configuration - either way, the scope's state going into this
+        # cycle's arm is not the known-clean baseline the rest of this
+        # method assumes. Halt rather than arm against an unknown baseline.
+        if self._scope.read_trigger_event_register():
+            self._open_mains_with_cooldown(context, include_cooldown=False)
+            raise _SequencerHalt(
+                terminal=Terminal.RIG_FAULT,
+                category=FaultCategory.RIG,
+                reason=_SCOPE_STALE_TRIGGER_EVENT_BEFORE_ARM_REASON,
+            )
+
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.SCOPE_ARMING)
         self._scope.arm_single()
 
@@ -429,6 +451,18 @@ class Sequencer:
                 reason="scope_lost_armed_before_injection",
             )
 
+        # Same intent as the armed recheck above, via a second, independent
+        # signal: a trigger event latched between arm_single and here means
+        # something fired before the deliberate K3 close, so any resulting
+        # waveform would not correspond to the intended K3-close transient.
+        if self._scope.read_trigger_event_register():
+            self._open_mains_with_cooldown(context, include_cooldown=False)
+            raise _SequencerHalt(
+                terminal=Terminal.RIG_FAULT,
+                category=FaultCategory.RIG,
+                reason=_SCOPE_TRIGGER_EVENT_BEFORE_INJECTION_REASON,
+            )
+
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.INJECTING)
         gate_token = ChargingGateToken(cycle_index=cycle_index, granted_at_monotonic_s=self._now())
         self._contactors.close_k3(gate_token)
@@ -445,11 +479,13 @@ class Sequencer:
             # SCOPE_TRIGGER_DEBUG_LOG.md Entry 3 for the incident that
             # required this ordering.
             self._open_mains_with_cooldown(context, include_cooldown=False)
-            self._capture_timeout_diagnostics_best_effort(context, run_dir=run_dir, run_id=run_id)
+            reason = self._capture_timeout_diagnostics_best_effort(
+                context, run_dir=run_dir, run_id=run_id
+            )
             raise _SequencerHalt(
                 terminal=Terminal.RIG_FAULT,
                 category=FaultCategory.RIG,
-                reason=_SCOPE_TIMEOUT_REASON,
+                reason=reason,
             )
 
     def _poll_scope_armed(self) -> bool:
@@ -515,13 +551,23 @@ class Sequencer:
             context.k3_open_reason = "acquisition_timeout"
         return False
 
-    def _capture_timeout_diagnostics_best_effort(self, context: _CycleContext, *, run_dir, run_id: str) -> None:
+    def _capture_timeout_diagnostics_best_effort(self, context: _CycleContext, *, run_dir, run_id: str) -> str:
         # Best-effort by design: an exception here must never prevent
         # safe-off or replace the primary halt reason (handoff safety
         # invariants 3-4). Full safe-off (K1+K2+K3 all commanded open) has
         # already completed by the time the caller invokes this - a hung
         # diagnostics call must never be able to delay de-energizing the
         # EVSE mains.
+        #
+        # Returns the halt reason to raise: the trigger-event-register
+        # value already present in the diagnostics bundle (Entry 8) decides
+        # between the generic never-triggered reason and the more specific
+        # triggered-but-not-completed reason (Entry 10). A failed/partial
+        # diagnostics capture - or a `trigger_event_register` reading this
+        # method can't parse - falls back to the generic, already-proven
+        # reason rather than asserting a trigger occurred on incomplete
+        # evidence.
+        reason = _SCOPE_TIMEOUT_REASON
         self._transition(
             context.transitions,
             cycle_index=context.cycle_index,
@@ -534,7 +580,9 @@ class Sequencer:
             self._logger.warning(
                 "cycle=%d timeout diagnostics capture failed: %s", context.cycle_index, exc
             )
-            return
+            return reason
+        if _diagnostics_trigger_event_seen(diagnostics.settings):
+            reason = _SCOPE_TRIGGERED_BUT_ACQUISITION_NOT_COMPLETED_REASON
         try:
             self._recorder.write_timeout_diagnostics(
                 run_dir=run_dir,
@@ -544,12 +592,13 @@ class Sequencer:
                 k3_closed_monotonic_s=context.k3_closed_monotonic_s,
                 k3_open_monotonic_s=context.k3_open_monotonic_s,
                 k3_open_reason=context.k3_open_reason,
-                primary_halt_reason=f"{FaultCategory.RIG.value}:{_SCOPE_TIMEOUT_REASON}",
+                primary_halt_reason=f"{FaultCategory.RIG.value}:{reason}",
             )
         except Exception as exc:
             self._logger.warning(
                 "cycle=%d timeout diagnostics write failed: %s", context.cycle_index, exc
             )
+        return reason
 
     def _assert_sufficient_disk_space(self, run_dir) -> None:
         """Fault-matrix row: halt before energizing anything if the run/output
@@ -794,3 +843,20 @@ def _pack_waveform_blob(samples: bytes, preamble: dict[str, object]) -> bytes:
         zf.writestr("samples.bin", samples)
         zf.writestr("preamble.json", json.dumps(preamble, sort_keys=True))
     return buffer.getvalue()
+
+
+def _diagnostics_trigger_event_seen(settings: Mapping[str, object]) -> bool:
+    """Parses the `trigger_event_register` field already captured in a
+    timeout-diagnostics bundle's settings (Entry 8's `:TER?` query).
+    Returns False - not just "unknown" - for a missing key (diagnostics
+    aborted before reaching this query) or an unparseable value (e.g. a
+    recorded `"<query failed: ...>"` error string): the caller must not
+    reclassify a halt as "trigger confirmed" on anything less than an
+    unambiguous reading."""
+    raw = settings.get("trigger_event_register")
+    if raw is None:
+        return False
+    try:
+        return int(float(str(raw))) != 0
+    except (TypeError, ValueError):
+        return False

@@ -23,6 +23,7 @@ class _FakeInstrument:
         self.fail_clear = False
         self.clear_error_text = "simulated VISA timeout for clear"
         self.clear_calls = 0
+        self.ter_response = "0"
 
     def write(self, command: str) -> None:
         self.commands.append(command)
@@ -56,7 +57,7 @@ class _FakeInstrument:
             ":TRIGger:MODE?": "EDGE",
             ":TRIGger:SWEep?": "NORMal",
             ":TRIGger:COUPling?": "DC",
-            ":TER?": "0",
+            ":TER?": self.ter_response,
             ":TRIGger:EDGE:SOURce?": "CHAN1",
             ":TRIGger:EDGE:SLOPe?": "POS",
             ":CHANnel1:DISPlay?": "1",
@@ -241,6 +242,31 @@ class ScopeRealTests(unittest.TestCase):
 
         self.assertIn(":TRIGger:COUPling DC", rm.inst.commands)
         self.assertNotIn(":TRIGger:NREJect OFF", rm.inst.commands)
+
+    def test_read_trigger_event_register_false_when_clear(self) -> None:
+        rm = _FakeRM()
+        rm.inst.ter_response = "+0"
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        self.assertFalse(scope.read_trigger_event_register())
+        self.assertIn(":TER?", rm.inst.queries)
+
+    def test_read_trigger_event_register_true_when_latched(self) -> None:
+        rm = _FakeRM()
+        rm.inst.ter_response = "+1"
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        self.assertTrue(scope.read_trigger_event_register())
 
     def test_configure_sends_opc_sync_barrier_after_commands(self) -> None:
         # arm_single() is called immediately after configure_for_cycle()

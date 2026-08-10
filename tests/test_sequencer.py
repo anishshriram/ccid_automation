@@ -397,6 +397,88 @@ class SequencerTests(unittest.TestCase):
         self.assertTrue((run_dir / "diagnostics" / "1" / "scope_timeout.png").exists())
         self.assertTrue((run_dir / "diagnostics" / "1" / "scope_errors.txt").exists())
 
+    def test_scope_triggered_but_acquisition_not_completed_reclassifies_halt(self) -> None:
+        # SCOPE_TRIGGER_DEBUG_LOG.md Entry 10: a real cycle found
+        # trigger_event_register = +1 in the diagnostics bundle while the
+        # acquisition subsystem still never reported Stop. That is a
+        # different failure mode from a genuine no-trigger condition and
+        # must not be reported under the same generic halt reason.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(
+                never_triggered=True,
+                diagnostics_settings_overrides={"trigger_event_register": "+1"},
+            ),
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertIn("scope_triggered_but_acquisition_not_completed", result.halt_reason or "")
+
+        diag_path = run_dir / "diagnostics" / "1" / "scope_state.json"
+        diag = json.loads(diag_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            diag["primary_halt_reason"], "rig:scope_triggered_but_acquisition_not_completed"
+        )
+
+    def test_scope_never_triggered_keeps_generic_reason_when_ter_unavailable(self) -> None:
+        # Diagnostics with no trigger_event_register key at all (e.g. a
+        # partial/aborted capture) must fall back to the original generic
+        # reason, not assert a trigger occurred on incomplete evidence.
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(never_triggered=True),
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertIn("scope_never_triggered_or_acquire_timeout", result.halt_reason or "")
+        self.assertNotIn("scope_triggered_but_acquisition_not_completed", result.halt_reason or "")
+
+    def test_stale_trigger_event_before_arm_halts_before_arming(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(trigger_event_latched_at_configure=True)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertIn("scope_stale_trigger_event_before_arm", result.halt_reason or "")
+        operations = [event.operation for event in contactors.events()]
+        self.assertNotIn("close_k3", operations)
+        snapshot = contactors.snapshot().commanded_closed
+        self.assertFalse(snapshot[ContactorName.K1])
+        self.assertFalse(snapshot[ContactorName.K2])
+        self.assertFalse(snapshot[ContactorName.K3])
+
+    def test_trigger_event_before_injection_never_closes_k3(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(trigger_event_latched_before_injection=True)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertIn("scope_trigger_event_before_injection", result.halt_reason or "")
+        operations = [event.operation for event in contactors.events()]
+        self.assertNotIn("close_k3", operations)
+
     def test_diagnostics_capture_failure_does_not_block_safe_off(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)
         camera = _ScriptedCamera([LedState.CHARGING] * 120)

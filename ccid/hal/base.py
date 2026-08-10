@@ -236,6 +236,25 @@ class ScopeInterface(ABC):
         pass
 
     @abstractmethod
+    def read_trigger_event_register(self) -> bool:
+        """Query the top-level trigger event register (`:TER?`) - answers
+        "has a trigger event occurred" independent of whether the
+        acquisition subsystem ever reached Stop. SCPI convention is
+        read-and-clear (a second immediate call is expected to return
+        False unless another trigger event has occurred in between) - not
+        yet independently confirmed on the real instrument, so callers
+        must not assume a value persists across repeated reads.
+
+        Only for live pre-injection checkpoints (baseline after configure,
+        recheck immediately before K3 closes). Must not be polled inside
+        the acquisition-timeout/backstop loop - see
+        SCOPE_TRIGGER_DEBUG_LOG.md Entry 10 for why that loop's timing
+        margin is not spent on this. Post-timeout classification instead
+        reads the value already captured by `capture_timeout_diagnostics`.
+        """
+        pass
+
+    @abstractmethod
     def capture_after_acquire(self) -> WaveformCapture:
         pass
 

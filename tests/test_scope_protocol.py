@@ -96,6 +96,9 @@ class _FakeScope(ScopeInterface):
         self._status = ScopeStatus.COMPLETE
         return True
 
+    def read_trigger_event_register(self) -> bool:
+        return False
+
     def capture_after_acquire(self) -> WaveformCapture:
         return WaveformCapture(
             samples=b"\x01\x02",
@@ -189,6 +192,7 @@ class HalProtocolTests(unittest.TestCase):
         scope.configure_for_cycle(ScopeSettings())
         scope.arm_single()
         self.assertTrue(scope.wait_until_armed(timeout_s=2.0, now_monotonic_s=1.0))
+        self.assertFalse(scope.read_trigger_event_register())
         self.assertTrue(scope.wait_until_acquisition_complete(timeout_s=5.0, now_monotonic_s=2.0))
         capture = scope.capture_after_acquire()
         self.assertIn("x_increment", capture.preamble)

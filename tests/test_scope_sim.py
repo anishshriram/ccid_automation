@@ -46,6 +46,37 @@ class ScopeSimTests(unittest.TestCase):
         self.assertFalse(scope.wait_until_acquisition_complete(timeout_s=5.0, now_monotonic_s=self.clock.now()))
         self.assertEqual(scope.status(), ScopeStatus.ARMED)
 
+    def test_trigger_event_register_clear_by_default(self) -> None:
+        scope = ScopeSim(monotonic_now=self.clock.now)
+        scope.connect()
+        scope.configure_for_cycle(ScopeSettings())
+        self.assertFalse(scope.read_trigger_event_register())
+        scope.arm_single()
+        self.assertFalse(scope.read_trigger_event_register())
+
+    def test_trigger_event_register_latched_stale_before_arm(self) -> None:
+        scope = ScopeSim(
+            scenario=ScopeSimScenario(trigger_event_latched_at_configure=True),
+            monotonic_now=self.clock.now,
+        )
+        scope.connect()
+        scope.configure_for_cycle(ScopeSettings())
+        self.assertTrue(scope.read_trigger_event_register())
+        # Read-and-clear: a second immediate read must not still be latched.
+        self.assertFalse(scope.read_trigger_event_register())
+
+    def test_trigger_event_register_latched_before_injection(self) -> None:
+        scope = ScopeSim(
+            scenario=ScopeSimScenario(trigger_event_latched_before_injection=True),
+            monotonic_now=self.clock.now,
+        )
+        scope.connect()
+        scope.configure_for_cycle(ScopeSettings())
+        self.assertFalse(scope.read_trigger_event_register())
+        scope.arm_single()
+        self.assertTrue(scope.read_trigger_event_register())
+        self.assertFalse(scope.read_trigger_event_register())
+
     def test_pretrigger_leakage_and_no_trip_flags(self) -> None:
         scope = ScopeSim(
             scenario=ScopeSimScenario(pretrigger_leakage=True, no_trip=True, sample_count=4000),

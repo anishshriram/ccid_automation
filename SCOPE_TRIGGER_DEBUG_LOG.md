@@ -10,20 +10,39 @@ up to date rather than buried at the bottom.
 
 ## Current status (as of 2026-08-10)
 
-**Not solved.** A clean, de-energized `configure --real` check of Entry 8's
-changes found `-113,"Undefined header"` in the scope's error queue.
-`:TRIGger:NREJect` was confirmed (via real hardware testing) to be the
-unsupported command on this MSO-X 2014A; `:TRIGger:COUPling` was confirmed
-supported and reads back correctly as `DC`. An interim fix (now reverted)
-had drained and *discarded* any configuration error to keep cycles
-running - Entry 9 corrects that: an unsupported/rejected configuration
-command must **block the cycle**, not be silently absorbed. `:TRIGger:NREJect
-OFF` is removed entirely; `configure_for_cycle` now raises
-`ScopeConfigurationError` if the error queue is nonzero after `*OPC?`,
-which (via the sequencer's existing exception handling) halts the cycle
-before `arm_single()`/`close_k3()` can ever be called. **Untested against
-real hardware** - the next `configure --real` check should now come back
-clean with no error and no exception.
+**Not solved, but reframed.** Entry 9's config-error-blocking fix has since
+been **confirmed clean on real hardware** (operator-verified `configure
+--real` check: no rejected commands, no exception) - that part of the
+investigation is closed.
+
+The active new fact is from a real energized cycle's diagnostics bundle:
+`trigger_event_register` (`:TER?`) read back `+1` while `operation_condition`
+stayed at `40` for the whole window and `hal_status` stayed `ACQUIRING`. This
+is a **proven fact, not a hypothesis**, and it changes the framing of the
+whole investigation: `:TER?` is a top-level status register that latches
+independently of the operation-condition run bit - a `+1` reading means the
+trigger comparator *did* see a qualifying edge. Every earlier entry's "never
+triggered" language describes a state (run bit never clears) that turns out
+to be consistent with two different underlying conditions: a genuine
+no-trigger, or a real trigger whose occurrence the acquisition subsystem
+never signaled as Stop. Those are different failure modes and were being
+collapsed into one halt reason.
+
+Entry 10 adds `read_trigger_event_register()` (`:TER?`) as a live checkpoint
+read at two points - immediately after `configure_for_cycle` (baseline,
+before arm) and immediately before K3 closes (pre-injection recheck) - plus
+uses the `trigger_event_register` value already captured by the existing
+post-timeout diagnostics bundle (Entry 8) to split the old generic timeout
+halt into two distinct reasons: `scope_never_triggered_or_acquire_timeout`
+(TER confirmed 0, or unknown) vs. `scope_triggered_but_acquisition_not_completed`
+(TER confirmed 1). Deliberately does **not** poll `:TER?` inside the 10 ms
+acquisition/backstop loop - see Entry 10 for why. **Untested against real
+hardware** - the next energized cycle is what will actually show, for the
+first time, whether the halt reason for the next occurrence of this failure
+comes back as the generic reason or the new triggered-but-not-completed one.
+Also still unconfirmed: whether `:TER?` is read-and-clear on this specific
+instrument (assumed per SCPI convention, not yet independently verified the
+way `:TRIGger:NREJect`'s unsupported status was in Entry 9).
 
 Entry 7's probe-ratio-ordering fix was tried on a real
 energized cycle (Entry 8) and did **not** fix it - channel/trigger-edge
@@ -295,6 +314,85 @@ New tests: `test_configure_sets_trigger_coupling_dc_and_disables_noise_reject`, 
 - After `*OPC?`, `configure_for_cycle` now drains the error queue into a bounded list (`_drain_configuration_errors`, same 20-read bound as elsewhere) and, if it's nonempty, raises a new `ScopeConfigurationError` naming every rejected command. This relies on the sequencer's existing exception handling - `_attempt_cycle` only calls `arm_single()`/`close_k3()` after `configure_for_cycle()` returns normally, so the exception reaches the run loop before either can happen, and `Sequencer.run()`'s `finally` still opens K1/K2 via `safe_off()` regardless. No sequencer changes were needed - the existing `CcidError` halt path already does exactly the right thing.
 
 New tests: `test_configure_raises_when_scope_rejects_a_configuration_command`, `test_configure_raises_with_all_rejected_commands_listed`, `test_configure_error_drain_is_bounded_and_still_raises`, `test_configure_does_not_raise_when_error_queue_is_clean` (`test_scope_real.py`), and `test_rejected_configuration_command_blocks_arming_and_k3_injection` (`test_sequencer.py`) - the last one is the test that actually proves the safety property: a scope whose `configure_for_cycle` raises never gets `close_k3` called, and K1/K2/K3 all end up open. Full suite: 310 tests, OK, same 2 intentional skips. **Not yet tested against real hardware** - the next `configure --real` check should come back clean with no error and no exception raised.
+
+---
+
+## Entry 10 - 2026-08-10 - Trigger event register instrumentation: distinguish "triggered but stuck" from "never triggered"
+
+**What was tried:** A real energized cycle's post-timeout diagnostics bundle
+(Entry 8's `:TER?` query) showed `trigger_event_register = +1` while
+`operation_condition` stayed at `40` (run bit set) for the entire acquisition
+window and `hal_status` stayed `ACQUIRING`. Since `:TER?` is a top-level
+status register answering "has a trigger event occurred" independent of the
+operation-condition run bit, this is direct evidence that the trigger
+comparator fired even though the acquisition subsystem never reported Stop -
+a materially different condition from a genuine no-trigger, previously
+indistinguishable under the single `scope_never_triggered_or_acquire_timeout`
+halt reason.
+
+Added:
+- `ScopeInterface.read_trigger_event_register() -> bool` (new abstract
+  method), implemented in `ScopeReal` (`:TER?` via the normal retried
+  `_query`) and `ScopeSim` (scenario-driven, read-and-clear semantics
+  modeled explicitly for tests).
+- A baseline checkpoint read immediately after `configure_for_cycle`
+  returns, before `arm_single()`: a latched trigger event here means either
+  stale state from a prior cycle/session or a spurious trigger during
+  configuration, so the cycle halts (`scope_stale_trigger_event_before_arm`)
+  rather than arming against an unknown baseline.
+- A second checkpoint read at the existing pre-injection recheck (after the
+  0.05 s settle sleep, before K3 closes) alongside the existing
+  `wait_until_armed` recheck: a latched trigger event here means something
+  fired before the deliberate K3 close, so the resulting waveform would not
+  correspond to the intended transient. Halts with
+  `scope_trigger_event_before_injection` and, like the existing armed
+  recheck, never calls `close_k3`.
+- Reclassification of the post-timeout halt: `_capture_timeout_diagnostics_best_effort`
+  now inspects the `trigger_event_register` value already present in the
+  diagnostics bundle it captures (no new query) and returns
+  `scope_triggered_but_acquisition_not_completed` instead of the generic
+  `scope_never_triggered_or_acquire_timeout` when that value is confirmed
+  `1`. A missing key (diagnostics aborted early) or an unparseable value
+  falls back to the generic reason - the classification only fires on an
+  unambiguous positive reading, never as a default.
+
+Deliberately **not** done: polling `:TER?` inside the 10 ms
+`wait_until_acquisition_complete`/K3-backstop loop. That loop's timing
+margin is what the 300 ms K3 hard backstop depends on; doubling the SCPI
+round-trips per tick (`:OPERegister:CONDition?` plus `:TER?`) risks eating
+into that margin for a question the post-timeout diagnostics bundle already
+answers without any additional live query during the energized window.
+
+**Commit:** (pending)
+
+**Result:** Not yet tried against real hardware.
+
+**What this tells us:** Nothing new about root cause yet by itself - this is
+instrumentation and halt-reason classification, same as Entry 2's diagnostics
+capture was. Its value is in what the *next* real timeout's halt reason
+says: if `scope_triggered_but_acquisition_not_completed` appears, that
+confirms the trigger-comparator/acquisition-complete distinction as real and
+redirects the investigation toward why the acquisition subsystem doesn't
+recognize a trigger it demonstrably received (holdoff, memory depth,
+acquire-type interaction, or something not yet examined) rather than toward
+trigger-condition settings, which have now been checked repeatedly (Entries
+1, 7, 8) without resolving the halt. If the generic reason still appears
+instead, that's evidence the Entry 8 diagnostics observation was specific to
+that one cycle rather than a reproducible pattern.
+
+New tests: `test_read_trigger_event_register_false_when_clear`,
+`test_read_trigger_event_register_true_when_latched` (`test_scope_real.py`);
+`test_trigger_event_register_clear_by_default`,
+`test_trigger_event_register_latched_stale_before_arm`,
+`test_trigger_event_register_latched_before_injection` (`test_scope_sim.py`);
+`test_scope_triggered_but_acquisition_not_completed_reclassifies_halt`,
+`test_scope_never_triggered_keeps_generic_reason_when_ter_unavailable`,
+`test_stale_trigger_event_before_arm_halts_before_arming`,
+`test_trigger_event_before_injection_never_closes_k3` (`test_sequencer.py`);
+`test_scope_triggered_but_acquisition_not_completed_row`,
+`test_scope_stale_trigger_event_before_arm_row`,
+`test_scope_trigger_event_before_injection_row` (`test_faultmatrix.py`). Full
+suite: 322 tests, OK, same 2 intentional skips.
 
 ---
 
