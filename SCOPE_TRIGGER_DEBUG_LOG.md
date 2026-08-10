@@ -10,7 +10,20 @@ up to date rather than buried at the bottom.
 
 ## Current status (as of 2026-08-10)
 
-**Not solved.** Entry 7's probe-ratio-ordering fix was tried on a real
+**Not solved.** A clean, de-energized `configure --real` check of Entry 8's
+changes (before any energized trial) found `-113,"Undefined header"` left
+in the scope's error queue - one of the two new trigger commands
+(`:TRIGger:COUPling` or `:TRIGger:NREJect`) is not recognized by this
+instrument's SCPI parser. Rather than guess which one and burn another
+verification round-trip, Entry 9 makes `configure_for_cycle` drain and
+discard any error left by the configuration block - an unsupported
+optional/refinement command no longer blocks a cycle or pollutes the error
+queue for a later diagnostics capture. **Both trigger commands are still
+sent as before; only the queue-cleanup step is new. Untested against real
+hardware** - the next `configure --real` check should confirm the error
+queue comes back clean.
+
+Entry 7's probe-ratio-ordering fix was tried on a real
 energized cycle (Entry 8) and did **not** fix it - channel/trigger-edge
 settings all read back exactly as configured (trigger mode EDGE, source
 CHAN1, positive slope, +20V, probe 10x, scale 50V/div, AC channel
@@ -22,8 +35,7 @@ unexamined areas: trigger coupling/noise-reject (never touched or even
 read before now), and whether the operation-condition run bit actually
 proves "waiting for the intended trigger" as opposed to something else
 that also keeps it set. Entry 8 addresses both, plus adds a `*OPC?`
-synchronization barrier after configuration. **Untested against real
-hardware.**
+synchronization barrier after configuration.
 
 Earlier: a strong candidate root cause was found and fixed (Entry 7) via
 code review rather than another live trial: `:CHANnel1:PROBe` was being
@@ -252,7 +264,7 @@ Fixed: `:CHANnel1:PROBe` now sent first, before `:CHANnel1:SCALe`/`:CHANnel1:OFF
 
 **Result:** Failed the same way. Diagnostics captured cleanly this time (no wedge, no segfault - Entries 6/7's fixes held): `operation_condition = 40` for the whole acquisition window, `hal_status` stuck at `ACQUIRING`. Settings readback: trigger mode EDGE, source CHAN1, positive slope, +20V level, probe ratio 10x, channel scale 50V/div, channel coupling AC - all exactly as configured. K3 remained closed ~308ms then opened via the backstop (300ms configured + overhead) - the safety mechanism worked correctly. No acquisition ever completed.
 
-**Commit:** (pending)
+**Commit:** `a4c4315`
 
 **What this tells us:** Every channel/trigger-edge setting we can see is correct, and it still doesn't trigger - this rules out probe ratio as the sole explanation and narrows the remaining unknowns to two things nothing has touched or read before: (1) trigger coupling and noise reject, which are separate from channel coupling and control what the trigger *comparator* sees, not what gets digitized; (2) whether the operation-condition run bit (bit 3, `operation_condition`) actually proves "armed and waiting for the configured edge" as opposed to some other state that also happens to keep bit 3 set (e.g. repeated re-triggering without ever reaching Stop) - `operation_condition = 40` matches the exact "just armed" signature from the original handoff's own real-hardware characterization, which is at least consistent with genuine waiting, but doesn't prove it.
 
@@ -262,7 +274,21 @@ Addressed both, plus a related synchronization gap noticed during the review - `
 - `*OPC?` synchronization barrier added at the end of `configure_for_cycle`, before returning - blocks until every queued command has actually finished executing, not just been sent.
 - `:TRIGger:COUPling?`, `:TRIGger:NREJect?`, and `:TER?` (trigger event register - a top-level status register, separate from the operation condition register, that directly answers "has a trigger event occurred" independent of whether acquisition ever reached Stop) added to the timeout-diagnostics query list.
 
-New tests: `test_configure_sets_trigger_coupling_dc_and_disables_noise_reject`, `test_configure_sends_opc_sync_barrier_after_commands`, plus diagnostics assertions for the three new settings keys. Full suite: 305 tests, OK, same 2 intentional skips. **Not yet tested against real hardware.**
+New tests: `test_configure_sets_trigger_coupling_dc_and_disables_noise_reject`, `test_configure_sends_opc_sync_barrier_after_commands`, plus diagnostics assertions for the three new settings keys. Full suite: 305 tests, OK, same 2 intentional skips.
+
+---
+
+## Entry 9 - 2026-08-10 - Clean configure --real found -113 "Undefined header"; drain and discard configuration errors
+
+**What was tried:** A de-energized `configure --real` check of the Entry 8 changes, before risking another energized trial.
+
+**Result:** `-113,"Undefined header"` was left in the scope's error queue after a clean configure. This is a real SCPI error meaning the parser didn't recognize a command header at all - not that a value was rejected. Most likely `:TRIGger:COUPling`: many modern digital InfiniiVision scopes trigger off the already-digitized, already-channel-coupled waveform, and may not expose a separate trigger-path coupling setting distinct from channel coupling at all on this model - `:TRIGger:NREJect` is a simpler, more universal feature and is the less likely culprit, but neither is confirmed.
+
+**Commit:** (pending)
+
+**What this tells us:** Rather than guess which command is unsupported and spend another verification round-trip finding out, `configure_for_cycle` now drains and discards any error left in the queue after the configuration block (bounded to 20 reads, same pattern as the diagnostics error-queue drain). This is robust to either command being the culprit - or both - without needing to identify which one: an unsupported optional/refinement command no longer blocks a cycle, and critically, no longer leaves a stale error sitting in the queue where a *later* cycle's timeout diagnostics would misreport it as relevant to that later failure. Both commands are still sent as before; only the cleanup step is new - if `:TRIGger:COUPling` genuinely isn't supported on this instrument, that setting was never applied by the Entry 8 fix and the AC/DC-trigger-coupling hypothesis for the underlying no-trigger issue is unconfirmed either way (worth checking the `:TRIGger:COUPling?` diagnostics readback on the next real timeout - if it always reads back something other than `DC`, or errors, that hypothesis needs to be revisited or abandoned).
+
+New tests: `test_configure_drains_and_discards_configuration_errors`, `test_configure_error_drain_is_bounded`. Full suite: 307 tests, OK, same 2 intentional skips. **Not yet tested against real hardware** - the next `configure --real` check should confirm the error queue comes back clean.
 
 ---
 

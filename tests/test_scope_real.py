@@ -17,6 +17,7 @@ class _FakeInstrument:
         self.run_bit_sequence = [8, 8, 0]
         self.fail_commands: set[str] = set()
         self.always_error_queue = False
+        self.error_queue_seed: list[str] = []
         self._error_queue_calls = 0
         self.fail_png = False
         self.fail_clear = False
@@ -42,6 +43,8 @@ class _FakeInstrument:
                 return str(self.run_bit_sequence.pop(0))
             return "0"
         if command == ":SYSTem:ERRor?":
+            if self.error_queue_seed:
+                return self.error_queue_seed.pop(0)
             if self.always_error_queue:
                 self._error_queue_calls += 1
                 return f'-{self._error_queue_calls},"Simulated error {self._error_queue_calls}"'
@@ -258,6 +261,43 @@ class ScopeRealTests(unittest.TestCase):
         # configure_for_cycle() returns - *OPC? is queried last, after the
         # full command list, not interleaved with it.
         self.assertEqual(rm.inst.commands[-1], ":WAVeform:POINts:MODE RAW")
+
+    def test_configure_drains_and_discards_configuration_errors(self) -> None:
+        # Real hardware: a clean configure --real left -113 "Undefined
+        # header" in the error queue, most likely from an optional
+        # trigger-path command not supported on this instrument model. An
+        # unsupported optional command must not halt a cycle, and must not
+        # leave a stale error for a later timeout's diagnostics capture to
+        # misreport as relevant to that later failure.
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        rm.inst.error_queue_seed = ['-113,"Undefined header"']
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.configure_for_cycle(ScopeSettings())  # must not raise
+
+        self.assertEqual(scope.status(), ScopeStatus.CONFIGURED)
+        self.assertEqual(rm.inst.query(":SYSTem:ERRor?"), '+0,"No error"')  # queue left clean
+
+    def test_configure_error_drain_is_bounded(self) -> None:
+        rm = _FakeRM()
+        rm.inst.run_bit_sequence = [0]
+        rm.inst.always_error_queue = True  # never returns "+0,..." on its own
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.configure_for_cycle(ScopeSettings())  # must return, not loop forever
+
+        self.assertEqual(scope.status(), ScopeStatus.CONFIGURED)
 
     def test_timeout_diagnostics_captures_operation_condition_and_settings(self) -> None:
         rm = _FakeRM()
