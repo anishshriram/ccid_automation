@@ -72,6 +72,23 @@ class WaveformCapture:
 
 
 @dataclass(frozen=True)
+class ScopeTimeoutDiagnostics:
+    """Best-effort, read-only snapshot of scope state captured on a
+    scope-never-triggered-or-acquire-timeout halt. Never represents a
+    completed acquisition; a failed individual query is recorded inline
+    (e.g. a "<query failed: ...>" string in `settings`) rather than
+    aborting the whole capture."""
+
+    captured_at_utc: datetime
+    captured_at_monotonic_s: float
+    operation_condition: int
+    hal_status: str
+    settings: Mapping[str, object]
+    error_queue: tuple[str, ...]
+    scope_png: bytes
+
+
+@dataclass(frozen=True)
 class CameraFrame:
     frame_bgr: bytes
     width: int
@@ -214,6 +231,15 @@ class ScopeInterface(ABC):
 
     @abstractmethod
     def capture_after_acquire(self) -> WaveformCapture:
+        pass
+
+    @abstractmethod
+    def capture_timeout_diagnostics(self) -> ScopeTimeoutDiagnostics:
+        """Read-only best-effort snapshot for a scope-timeout halt.
+
+        Must never arm, trigger, run, or reconfigure the scope, and must
+        never be treated as a completed acquisition. Only called after the
+        caller has already confirmed K3 is commanded open."""
         pass
 
     @abstractmethod

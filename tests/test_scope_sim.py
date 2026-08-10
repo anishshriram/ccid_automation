@@ -100,6 +100,51 @@ class ScopeSimTests(unittest.TestCase):
         with self.assertRaises(ScopeSimCommunicationError):
             scope.connect()
 
+    def test_timeout_diagnostics_returns_deterministic_bundle(self) -> None:
+        scope = ScopeSim(monotonic_now=self.clock.now)
+        scope.connect()
+        scope.configure_for_cycle(ScopeSettings())
+
+        diagnostics = scope.capture_timeout_diagnostics()
+
+        self.assertEqual(diagnostics.operation_condition, 0)
+        self.assertEqual(diagnostics.settings["ch1_coupling"], "AC")
+        self.assertEqual(diagnostics.error_queue, ())
+        self.assertTrue(diagnostics.scope_png.startswith(b"\x89PNG"))
+
+    def test_timeout_diagnostics_respects_scenario_overrides(self) -> None:
+        scope = ScopeSim(
+            scenario=ScopeSimScenario(
+                diagnostics_operation_condition=32,
+                diagnostics_settings_overrides={"trigger_mode": "PATTern"},
+                diagnostics_error_queue=('-410,"Query INTERRUPTED"',),
+                diagnostics_scope_png=b"\x89PNG\r\n\x1a\nCUSTOM",
+            ),
+            monotonic_now=self.clock.now,
+        )
+        scope.connect()
+
+        diagnostics = scope.capture_timeout_diagnostics()
+
+        self.assertEqual(diagnostics.operation_condition, 32)
+        self.assertEqual(diagnostics.settings["trigger_mode"], "PATTern")
+        self.assertEqual(diagnostics.error_queue, ('-410,"Query INTERRUPTED"',))
+        self.assertEqual(diagnostics.scope_png, b"\x89PNG\r\n\x1a\nCUSTOM")
+
+    def test_timeout_diagnostics_comm_error_injection(self) -> None:
+        scope = ScopeSim(
+            scenario=ScopeSimScenario(force_comm_errors=frozenset({"timeout_diagnostics"})),
+            monotonic_now=self.clock.now,
+        )
+        scope.connect()
+        with self.assertRaises(ScopeSimCommunicationError):
+            scope.capture_timeout_diagnostics()
+
+    def test_timeout_diagnostics_requires_connected(self) -> None:
+        scope = ScopeSim(monotonic_now=self.clock.now)
+        with self.assertRaises(ScopeSimCommunicationError):
+            scope.capture_timeout_diagnostics()
+
 
 if __name__ == "__main__":
     unittest.main()

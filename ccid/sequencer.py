@@ -55,6 +55,11 @@ from ccid.states import CycleState, LedState, Terminal
 
 _LOGGER = logging.getLogger(__name__)
 
+# Shared between the halt reason raised below and the diagnostics bundle's
+# persisted `primary_halt_reason`, so the two strings can't silently drift
+# apart in a future edit.
+_SCOPE_TIMEOUT_REASON = "scope_never_triggered_or_acquire_timeout"
+
 
 class FaultCategory(str, Enum):
     DUT = "dut"
@@ -106,6 +111,9 @@ class _CycleContext:
     notes: list[str] = field(default_factory=list)
     led_state_at_gate: LedState = LedState.OFF_OR_UNKNOWN
     latch_slow_clear: bool = False
+    k3_closed_monotonic_s: float | None = None
+    k3_open_monotonic_s: float | None = None
+    k3_open_reason: str | None = None
 
 
 class Sequencer:
@@ -215,7 +223,7 @@ class Sequencer:
 
         while True:
             try:
-                self._attempt_cycle(context, run_dir=run_dir)
+                self._attempt_cycle(context, run_dir=run_dir, run_id=state.run_id)
             except _RetryCycle as retry:
                 if retry_used:
                     execution = self._halt_without_capture(
@@ -342,7 +350,7 @@ class Sequencer:
         )
         return execution, next_state, context.transitions
 
-    def _attempt_cycle(self, context: _CycleContext, *, run_dir) -> None:
+    def _attempt_cycle(self, context: _CycleContext, *, run_dir, run_id: str) -> None:
         cycle_index = context.cycle_index
         self._assert_sufficient_disk_space(run_dir)
 
@@ -425,16 +433,18 @@ class Sequencer:
         gate_token = ChargingGateToken(cycle_index=cycle_index, granted_at_monotonic_s=self._now())
         self._contactors.close_k3(gate_token)
         k3_closed_s = self._now()
+        context.k3_closed_monotonic_s = k3_closed_s
         self._assert_no_mains_mismatch()
 
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.ACQUIRING)
         acquired = self._poll_acquisition_with_backstop(context=context, k3_closed_s=k3_closed_s)
         if not acquired:
+            self._capture_timeout_diagnostics_best_effort(context, run_dir=run_dir, run_id=run_id)
             self._open_mains_with_cooldown(context, include_cooldown=False)
             raise _SequencerHalt(
                 terminal=Terminal.RIG_FAULT,
                 category=FaultCategory.RIG,
-                reason="scope_never_triggered_or_acquire_timeout",
+                reason=_SCOPE_TIMEOUT_REASON,
             )
 
     def _poll_scope_armed(self) -> bool:
@@ -469,6 +479,8 @@ class Sequencer:
                     detail="k3_backstop",
                 )
                 self._contactors.open_k3()
+                context.k3_open_monotonic_s = self._now()
+                context.k3_open_reason = "backstop"
                 opened = True
             if self._scope.wait_until_acquisition_complete(
                 timeout_s=min(0.01, acq_timeout_s - (now_s - start_s)),
@@ -482,6 +494,8 @@ class Sequencer:
                         detail="normal",
                     )
                     self._contactors.open_k3()
+                    context.k3_open_monotonic_s = self._now()
+                    context.k3_open_reason = "normal"
                 return True
             self._sleep(0.01)
         if not opened:
@@ -492,7 +506,43 @@ class Sequencer:
                 detail="acquisition_timeout",
             )
             self._contactors.open_k3()
+            context.k3_open_monotonic_s = self._now()
+            context.k3_open_reason = "acquisition_timeout"
         return False
+
+    def _capture_timeout_diagnostics_best_effort(self, context: _CycleContext, *, run_dir, run_id: str) -> None:
+        # Best-effort by design: an exception here must never prevent
+        # safe-off or replace the primary halt reason (handoff safety
+        # invariants 3-4). K3 is already commanded open by the caller
+        # before this runs.
+        self._transition(
+            context.transitions,
+            cycle_index=context.cycle_index,
+            state=CycleState.DIAGNOSTICS_CAPTURING,
+            detail=_SCOPE_TIMEOUT_REASON,
+        )
+        try:
+            diagnostics = self._scope.capture_timeout_diagnostics()
+        except Exception as exc:
+            self._logger.warning(
+                "cycle=%d timeout diagnostics capture failed: %s", context.cycle_index, exc
+            )
+            return
+        try:
+            self._recorder.write_timeout_diagnostics(
+                run_dir=run_dir,
+                run_id=run_id,
+                cycle_index=context.cycle_index,
+                diagnostics=diagnostics,
+                k3_closed_monotonic_s=context.k3_closed_monotonic_s,
+                k3_open_monotonic_s=context.k3_open_monotonic_s,
+                k3_open_reason=context.k3_open_reason,
+                primary_halt_reason=f"{FaultCategory.RIG.value}:{_SCOPE_TIMEOUT_REASON}",
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "cycle=%d timeout diagnostics write failed: %s", context.cycle_index, exc
+            )
 
     def _assert_sufficient_disk_space(self, run_dir) -> None:
         """Fault-matrix row: halt before energizing anything if the run/output

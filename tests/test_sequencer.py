@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,7 +11,7 @@ import numpy as np
 
 from ccid.classify import LedColor, frames_to_bgr_bytes, make_led_frame
 from ccid.config import AppConfig, TimingConfig, VisionConfig, load_config
-from ccid.hal.base import CameraFrame, CameraHealth, CameraStateSample, ContactorName
+from ccid.hal.base import CameraFrame, CameraHealth, CameraStateSample, ContactorName, ScopeTimeoutDiagnostics
 from ccid.hal.gpio_sim import GpioSimContactorController
 from ccid.hal.scope_sim import ScopeSim, ScopeSimScenario
 from ccid.recorder import RunRecorder
@@ -134,6 +135,14 @@ class _ArmedThenConsumedScope(ScopeSim):
             )
 
         return False
+
+class _FailingDiagnosticsScope(ScopeSim):
+    """Scope whose timeout-diagnostics capture always raises, for proving
+    safe-off and the primary halt reason survive a diagnostics failure."""
+
+    def capture_timeout_diagnostics(self) -> ScopeTimeoutDiagnostics:
+        raise RuntimeError("simulated diagnostics capture failure")
+
 
 class _TwoHueCamera:
     """Always returns a genuinely two-hue (blue+red) frame, exercising the
@@ -352,6 +361,81 @@ class SequencerTests(unittest.TestCase):
         self.assertEqual(result.terminal, Terminal.RIG_FAULT)
         self.assertEqual(result.fault_category, FaultCategory.RIG)
 
+        diag_path = run_dir / "diagnostics" / "1" / "scope_state.json"
+        self.assertTrue(diag_path.exists())
+        diag = json.loads(diag_path.read_text(encoding="utf-8"))
+        self.assertEqual(diag["primary_halt_reason"], "rig:scope_never_triggered_or_acquire_timeout")
+        self.assertIn(diag["k3_open_reason"], ("backstop", "acquisition_timeout"))
+        self.assertTrue((run_dir / "diagnostics" / "1" / "scope_timeout.png").exists())
+        self.assertTrue((run_dir / "diagnostics" / "1" / "scope_errors.txt").exists())
+
+    def test_diagnostics_capture_failure_does_not_block_safe_off(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(never_triggered=True)
+        scope = _FailingDiagnosticsScope(scenario=scenario, monotonic_now=self.clock.now)
+
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertEqual(result.halt_reason, "rig:scope_never_triggered_or_acquire_timeout")
+        snapshot = contactors.snapshot().commanded_closed
+        self.assertFalse(snapshot[ContactorName.K1])
+        self.assertFalse(snapshot[ContactorName.K2])
+        self.assertFalse(snapshot[ContactorName.K3])
+        self.assertFalse((run_dir / "diagnostics" / "1" / "scope_state.json").exists())
+
+    def test_diagnostics_write_failure_does_not_block_safe_off_or_change_halt_reason(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(never_triggered=True),
+            contactors=contactors,
+        )
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError("simulated diagnostics write failure")
+
+        self.recorder.write_timeout_diagnostics = _raise
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        self.assertEqual(result.halt_reason, "rig:scope_never_triggered_or_acquire_timeout")
+        snapshot = contactors.snapshot().commanded_closed
+        self.assertFalse(snapshot[ContactorName.K1])
+        self.assertFalse(snapshot[ContactorName.K2])
+        self.assertFalse(snapshot[ContactorName.K3])
+
+    def test_diagnostics_capture_never_recloses_k3_or_rearms(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=self._scope_scenario(never_triggered=True),
+            contactors=contactors,
+        )
+
+        sequencer.run(run_dir=run_dir, state=state)
+
+        events = contactors.events()
+        last_open_k3_index = max(i for i, e in enumerate(events) if e.operation == "open_k3")
+        self.assertNotIn(
+            "close_k3",
+            [e.operation for e in events[last_open_k3_index + 1 :]],
+        )
+
     def test_scope_consumed_before_injection_never_closes_k3(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)
         camera = _ScriptedCamera(
@@ -422,6 +506,12 @@ class SequencerTests(unittest.TestCase):
             k3_duration_s,
             self.base_config.timing.k3_backstop_s + 0.02,
         )
+
+        diag = json.loads(
+            (run_dir / "diagnostics" / "1" / "scope_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(diag["k3_open_reason"], "backstop")
+        self.assertAlmostEqual(diag["k3_duration_s"], k3_duration_s, places=6)
 
     def test_pretrigger_leakage_halts_as_rig_fault(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)

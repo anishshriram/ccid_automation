@@ -5,7 +5,40 @@ import time
 from typing import Callable, Mapping
 
 from ccid.errors import HardwareInterfaceError
-from ccid.hal.base import ScopeInterface, ScopeSettings, ScopeStatus, WaveformCapture
+from ccid.hal.base import (
+    ScopeInterface,
+    ScopeSettings,
+    ScopeStatus,
+    ScopeTimeoutDiagnostics,
+    WaveformCapture,
+)
+
+# Read-only settings queried for a timeout-diagnostics snapshot. Each maps a
+# result key to the exact `?`-suffixed SCPI query - none of these mutate
+# scope state, unlike the write commands in `configure_for_cycle`.
+_DIAGNOSTIC_SETTINGS_QUERIES: tuple[tuple[str, str], ...] = (
+    ("ch1_display", ":CHANnel1:DISPlay?"),
+    ("ch1_coupling", ":CHANnel1:COUPling?"),
+    ("ch1_scale", ":CHANnel1:SCALe?"),
+    ("ch1_offset", ":CHANnel1:OFFSet?"),
+    ("ch1_probe_ratio", ":CHANnel1:PROBe?"),
+    ("ch1_bandwidth_limit", ":CHANnel1:BWLimit?"),
+    ("ch1_invert", ":CHANnel1:INVert?"),
+    ("trigger_mode", ":TRIGger:MODE?"),
+    ("trigger_sweep", ":TRIGger:SWEep?"),
+    ("trigger_edge_source", ":TRIGger:EDGE:SOURce?"),
+    ("trigger_edge_slope", ":TRIGger:EDGE:SLOPe?"),
+    ("trigger_edge_level", ":TRIGger:EDGE:LEVel?"),
+    ("timebase_scale", ":TIMebase:SCALe?"),
+    ("timebase_reference", ":TIMebase:REFerence?"),
+    ("acquire_type", ":ACQuire:TYPE?"),
+    ("waveform_source", ":WAVeform:SOURce?"),
+    ("waveform_format", ":WAVeform:FORMat?"),
+    ("waveform_points_mode", ":WAVeform:POINts:MODE?"),
+    ("waveform_points", ":WAVeform:POINts?"),
+)
+
+_DIAGNOSTIC_ERROR_QUEUE_MAX_READS = 20
 
 
 class ScopeRealError(HardwareInterfaceError):
@@ -160,6 +193,73 @@ class ScopeReal(ScopeInterface):
             scope_png=png,
             captured_at_utc=datetime.now(tz=timezone.utc),
         )
+
+    def capture_timeout_diagnostics(self) -> ScopeTimeoutDiagnostics:
+        # Deliberately bypasses `_query`/`_query_binary`/`_retry_io`: a scope
+        # that just failed to report acquisition-complete is plausibly
+        # wedged, and `_retry_io`'s reconnect-on-failure could add many
+        # seconds of blocking reconnect attempts across ~20 queries before
+        # K1/K2 ever open. Every query here is independently best-effort -
+        # one failed field must not discard the rest, and this method must
+        # never send a write/config/arm/trigger command.
+        if self._inst is None:
+            return ScopeTimeoutDiagnostics(
+                captured_at_utc=datetime.now(tz=timezone.utc),
+                captured_at_monotonic_s=self._now(),
+                operation_condition=-1,
+                hal_status=self._status.value,
+                settings={"connection": "<not connected>"},
+                error_queue=(),
+                scope_png=b"",
+            )
+
+        settings: dict[str, object] = {}
+        for key, command in _DIAGNOSTIC_SETTINGS_QUERIES:
+            settings[key] = self._diag_query(command)
+
+        operation_condition = -1
+        raw_condition = self._diag_query(":OPERegister:CONDition?")
+        if not raw_condition.startswith("<query failed"):
+            try:
+                operation_condition = int(float(raw_condition))
+            except ValueError:
+                settings["operation_condition_parse_error"] = raw_condition
+
+        error_queue = self._drain_error_queue()
+
+        scope_png = b""
+        try:
+            scope_png = self._inst.query_binary_values(
+                ":DISPlay:DATA? PNG", datatype="B", container=bytes
+            )
+            scope_png = bytes(scope_png)
+        except Exception as exc:
+            settings["scope_png_capture_error"] = f"<query failed: {exc}>"
+
+        return ScopeTimeoutDiagnostics(
+            captured_at_utc=datetime.now(tz=timezone.utc),
+            captured_at_monotonic_s=self._now(),
+            operation_condition=operation_condition,
+            hal_status=self._status.value,
+            settings=settings,
+            error_queue=error_queue,
+            scope_png=scope_png,
+        )
+
+    def _diag_query(self, command: str) -> str:
+        try:
+            return str(self._inst.query(command)).strip()
+        except Exception as exc:
+            return f"<query failed: {exc}>"
+
+    def _drain_error_queue(self) -> tuple[str, ...]:
+        errors: list[str] = []
+        for _ in range(_DIAGNOSTIC_ERROR_QUEUE_MAX_READS):
+            response = self._diag_query(":SYSTem:ERRor?")
+            if response.startswith("<query failed") or response.startswith("+0,"):
+                break
+            errors.append(response)
+        return tuple(errors)
 
     def status(self) -> ScopeStatus:
         return self._status

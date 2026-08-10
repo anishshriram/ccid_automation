@@ -6,7 +6,13 @@ import math
 from typing import Callable, Mapping
 
 from ccid.errors import HardwareInterfaceError
-from ccid.hal.base import ScopeInterface, ScopeSettings, ScopeStatus, WaveformCapture
+from ccid.hal.base import (
+    ScopeInterface,
+    ScopeSettings,
+    ScopeStatus,
+    ScopeTimeoutDiagnostics,
+    WaveformCapture,
+)
 
 
 class ScopeSimCommunicationError(HardwareInterfaceError):
@@ -32,6 +38,10 @@ class ScopeSimScenario:
     missing_preamble_fields: tuple[str, ...] = field(default_factory=tuple)
     force_comm_errors: frozenset[str] = field(default_factory=frozenset)
     preamble_overrides: Mapping[str, float | int | str] = field(default_factory=dict)
+    diagnostics_operation_condition: int = 0
+    diagnostics_settings_overrides: Mapping[str, object] = field(default_factory=dict)
+    diagnostics_error_queue: tuple[str, ...] = field(default_factory=tuple)
+    diagnostics_scope_png: bytes = b"\x89PNG\r\n\x1a\nSCOPE_SIM"
 
 
 class ScopeSim(ScopeInterface):
@@ -144,6 +154,37 @@ class ScopeSim(ScopeInterface):
             settings_readback=self.readback_settings(),
             scope_png=b"\x89PNG\r\n\x1a\nSCOPE_SIM",
             captured_at_utc=datetime.now(tz=timezone.utc),
+        )
+
+    def capture_timeout_diagnostics(self) -> ScopeTimeoutDiagnostics:
+        self._require_connected()
+        self._maybe_raise("timeout_diagnostics")
+        settings: dict[str, object] = {
+            "ch1_coupling": self._settings.channel1_coupling,
+            "ch1_scale": self._settings.channel1_scale_v_per_div,
+            "ch1_offset": self._settings.channel1_offset_v,
+            "ch1_probe_ratio": self._settings.channel1_probe_ratio,
+            "trigger_sweep": self._settings.trigger_sweep,
+            "trigger_edge_source": self._settings.trigger_source,
+            "trigger_edge_slope": self._settings.trigger_slope,
+            "trigger_edge_level": self._settings.trigger_level_v,
+            "timebase_scale": self._settings.timebase_scale_s_per_div,
+            "timebase_reference": self._settings.timebase_reference,
+            "acquire_type": self._settings.acquire_type,
+            "waveform_source": self._settings.waveform_source,
+            "waveform_format": self._settings.waveform_format,
+            "waveform_points_mode": self._settings.waveform_points_mode,
+            "waveform_points": self._settings.waveform_points,
+        }
+        settings.update(self._scenario.diagnostics_settings_overrides)
+        return ScopeTimeoutDiagnostics(
+            captured_at_utc=datetime.now(tz=timezone.utc),
+            captured_at_monotonic_s=self._monotonic_now(),
+            operation_condition=self._scenario.diagnostics_operation_condition,
+            hal_status=self._status.value,
+            settings=settings,
+            error_queue=self._scenario.diagnostics_error_queue,
+            scope_png=self._scenario.diagnostics_scope_png,
         )
 
     def status(self) -> ScopeStatus:

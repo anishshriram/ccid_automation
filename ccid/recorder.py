@@ -36,6 +36,7 @@ import zipfile
 
 from ccid import __version__
 from ccid.errors import ConfigHashMismatchError, PersistenceError, ResumeBlockedError
+from ccid.hal.base import ScopeTimeoutDiagnostics
 
 
 @dataclass(frozen=True)
@@ -254,6 +255,54 @@ class RunRecorder:
             self._heartbeat_sender(next_state.run_id, next_state.last_completed_cycle)
         self._checkpoint("after_heartbeat")
         return next_state
+
+    def write_timeout_diagnostics(
+        self,
+        *,
+        run_dir: Path,
+        run_id: str,
+        cycle_index: int,
+        diagnostics: ScopeTimeoutDiagnostics,
+        k3_closed_monotonic_s: float | None,
+        k3_open_monotonic_s: float | None,
+        k3_open_reason: str | None,
+        primary_halt_reason: str,
+    ) -> None:
+        """Best-effort evidence capture for a scope-timeout halt.
+
+        Deliberately outside the crash-safe commit contract described in
+        this module's docstring: takes no `RunState`, never touches
+        `runstate.json`, and never advances `last_completed_cycle`. Writes
+        under `diagnostics/<cycle_index>/`, a subtree `_ensure_layout` and
+        `_delete_orphans` never look at.
+        """
+
+        diag_dir = run_dir / "diagnostics" / str(cycle_index)
+        k3_duration_s = None
+        if k3_closed_monotonic_s is not None and k3_open_monotonic_s is not None:
+            k3_duration_s = k3_open_monotonic_s - k3_closed_monotonic_s
+
+        self._write_bytes_and_fsync(diag_dir / "scope_timeout.png", diagnostics.scope_png)
+        self._write_json_and_fsync(
+            diag_dir / "scope_state.json",
+            {
+                "run_id": run_id,
+                "cycle_index": cycle_index,
+                "primary_halt_reason": primary_halt_reason,
+                "software_version": __version__,
+                "captured_at_utc": diagnostics.captured_at_utc.isoformat(),
+                "captured_at_monotonic_s": diagnostics.captured_at_monotonic_s,
+                "operation_condition": diagnostics.operation_condition,
+                "hal_status": diagnostics.hal_status,
+                "settings": dict(diagnostics.settings),
+                "k3_closed_monotonic_s": k3_closed_monotonic_s,
+                "k3_open_monotonic_s": k3_open_monotonic_s,
+                "k3_open_reason": k3_open_reason,
+                "k3_duration_s": k3_duration_s,
+            },
+        )
+        errors_text = "\n".join(diagnostics.error_queue) + "\n" if diagnostics.error_queue else "no errors\n"
+        self._write_bytes_and_fsync(diag_dir / "scope_errors.txt", errors_text.encode("utf-8"))
 
     def _checkpoint(self, step_name: str) -> None:
         if self._crash_injector is not None:

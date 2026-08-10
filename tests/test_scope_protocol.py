@@ -16,6 +16,7 @@ from ccid.hal.base import (
     ScopeInterface,
     ScopeSettings,
     ScopeStatus,
+    ScopeTimeoutDiagnostics,
     WaveformCapture,
 )
 from ccid.states import LedState
@@ -104,6 +105,17 @@ class _FakeScope(ScopeInterface):
             captured_at_utc=datetime.now(tz=timezone.utc),
         )
 
+    def capture_timeout_diagnostics(self) -> ScopeTimeoutDiagnostics:
+        return ScopeTimeoutDiagnostics(
+            captured_at_utc=datetime.now(tz=timezone.utc),
+            captured_at_monotonic_s=1.0,
+            operation_condition=0,
+            hal_status=self._status.value,
+            settings={"waveform_points_mode": self._settings.waveform_points_mode},
+            error_queue=(),
+            scope_png=b"png",
+        )
+
     def status(self) -> ScopeStatus:
         return self._status
 
@@ -181,6 +193,17 @@ class HalProtocolTests(unittest.TestCase):
         capture = scope.capture_after_acquire()
         self.assertIn("x_increment", capture.preamble)
         self.assertEqual(scope.status(), ScopeStatus.COMPLETE)
+
+    def test_scope_timeout_diagnostics_contract_shape(self) -> None:
+        scope = _FakeScope()
+        scope.connect()
+        diagnostics = scope.capture_timeout_diagnostics()
+
+        self.assertIsInstance(diagnostics, ScopeTimeoutDiagnostics)
+        self.assertIsInstance(diagnostics.operation_condition, int)
+        self.assertIsInstance(diagnostics.settings, dict)
+        self.assertIsInstance(diagnostics.error_queue, tuple)
+        self.assertIsInstance(diagnostics.scope_png, bytes)
 
     def test_default_scope_settings_preserve_pre_and_post_trigger_history(self) -> None:
         settings = ScopeSettings()

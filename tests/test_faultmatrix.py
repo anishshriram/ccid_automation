@@ -325,6 +325,9 @@ class FaultMatrixTests(unittest.TestCase):
         self._assert_safe_and_ordered(contactors)
         self._assert_runstate(run_dir, halt_reason_present=True)
         self.assertFalse(self._artifact_committed(run_dir))  # halted before any capture.
+        self.assertTrue((run_dir / "diagnostics" / "1" / "scope_timeout.png").exists())
+        self.assertTrue((run_dir / "diagnostics" / "1" / "scope_state.json").exists())
+        self.assertTrue((run_dir / "diagnostics" / "1" / "scope_errors.txt").exists())
 
     def test_k3_pretrigger_leakage_row(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)

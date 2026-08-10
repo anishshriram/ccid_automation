@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
+from ccid.hal.base import ScopeTimeoutDiagnostics
 from ccid.recorder import CycleArtifacts, CycleCsvRow, RunRecorder
 
 
@@ -95,6 +97,80 @@ class RecorderTests(unittest.TestCase):
             halt_reason="dut_no_trip",
         )
         self.assertEqual(next_state.halt_reason, "dut_no_trip")
+
+    @staticmethod
+    def _diagnostics(error_queue: tuple[str, ...] = ()) -> ScopeTimeoutDiagnostics:
+        return ScopeTimeoutDiagnostics(
+            captured_at_utc=datetime(2026, 8, 10, tzinfo=timezone.utc),
+            captured_at_monotonic_s=873.9,
+            operation_condition=32,
+            hal_status="ARMED",
+            settings={"trigger_mode": "EDGE", "ch1_coupling": "AC"},
+            error_queue=error_queue,
+            scope_png=b"\x89PNG\r\n\x1a\ntimeout",
+        )
+
+    def test_write_timeout_diagnostics_writes_expected_files(self) -> None:
+        self.recorder.write_timeout_diagnostics(
+            run_dir=self.run_dir,
+            run_id="20260803_135500",
+            cycle_index=1,
+            diagnostics=self._diagnostics(error_queue=('-410,"Query INTERRUPTED"',)),
+            k3_closed_monotonic_s=873.9,
+            k3_open_monotonic_s=874.2,
+            k3_open_reason="backstop",
+            primary_halt_reason="rig:scope_never_triggered_or_acquire_timeout",
+        )
+
+        diag_dir = self.run_dir / "diagnostics" / "1"
+        self.assertTrue((diag_dir / "scope_timeout.png").exists())
+        self.assertEqual((diag_dir / "scope_timeout.png").read_bytes(), b"\x89PNG\r\n\x1a\ntimeout")
+
+        state = json.loads((diag_dir / "scope_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["run_id"], "20260803_135500")
+        self.assertEqual(state["cycle_index"], 1)
+        self.assertEqual(state["operation_condition"], 32)
+        self.assertEqual(state["settings"]["trigger_mode"], "EDGE")
+        self.assertEqual(state["k3_open_reason"], "backstop")
+        self.assertAlmostEqual(state["k3_duration_s"], 0.3, places=6)
+        self.assertEqual(state["primary_halt_reason"], "rig:scope_never_triggered_or_acquire_timeout")
+
+        errors_text = (diag_dir / "scope_errors.txt").read_text(encoding="utf-8")
+        self.assertIn("Query INTERRUPTED", errors_text)
+
+    def test_write_timeout_diagnostics_does_not_touch_normal_artifacts_or_runstate(self) -> None:
+        runstate_before = (self.run_dir / "runstate.json").read_bytes()
+
+        self.recorder.write_timeout_diagnostics(
+            run_dir=self.run_dir,
+            run_id="20260803_135500",
+            cycle_index=1,
+            diagnostics=self._diagnostics(),
+            k3_closed_monotonic_s=None,
+            k3_open_monotonic_s=None,
+            k3_open_reason=None,
+            primary_halt_reason="rig:scope_never_triggered_or_acquire_timeout",
+        )
+
+        self.assertEqual((self.run_dir / "runstate.json").read_bytes(), runstate_before)
+        self.assertFalse((self.run_dir / "waveforms" / "1.npz").exists())
+        self.assertFalse((self.run_dir / "images" / "1_scope.png").exists())
+        self.assertFalse((self.run_dir / "cycles" / "1.json").exists())
+
+    def test_write_timeout_diagnostics_no_errors_marker(self) -> None:
+        self.recorder.write_timeout_diagnostics(
+            run_dir=self.run_dir,
+            run_id="20260803_135500",
+            cycle_index=1,
+            diagnostics=self._diagnostics(error_queue=()),
+            k3_closed_monotonic_s=None,
+            k3_open_monotonic_s=None,
+            k3_open_reason=None,
+            primary_halt_reason="rig:scope_never_triggered_or_acquire_timeout",
+        )
+
+        errors_text = (self.run_dir / "diagnostics" / "1" / "scope_errors.txt").read_text(encoding="utf-8")
+        self.assertEqual(errors_text, "no errors\n")
 
 
 if __name__ == "__main__":
