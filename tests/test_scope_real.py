@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import time
 import unittest
 
 from ccid.hal.base import ScopeSettings, ScopeStatus
@@ -13,14 +14,24 @@ class _FakeInstrument:
         self.closed = False
         self.run_bit_sequence = [8, 8, 0]
         self.fail_commands: set[str] = set()
+        self.slow_commands: dict[str, float] = {}
         self.always_error_queue = False
         self._error_queue_calls = 0
         self.fail_png = False
+        self.fail_clear = False
+        self.clear_calls = 0
 
     def write(self, command: str) -> None:
         self.commands.append(command)
 
+    def clear(self) -> None:
+        self.clear_calls += 1
+        if self.fail_clear:
+            raise TimeoutError("simulated VISA timeout for clear")
+
     def query(self, command: str) -> str:
+        if command in self.slow_commands:
+            time.sleep(self.slow_commands[command])
         if command in self.fail_commands:
             raise TimeoutError(f"simulated VISA timeout for {command}")
         if command == "*IDN?":
@@ -211,7 +222,10 @@ class ScopeRealTests(unittest.TestCase):
 
         self.assertEqual(rm.inst.commands, commands_before)
 
-    def test_timeout_diagnostics_partial_query_failure_still_returns_bundle(self) -> None:
+    def test_timeout_diagnostics_aborts_after_first_query_failure(self) -> None:
+        # Fail-fast, not best-effort-per-field: SCOPE_TRIGGER_DEBUG_LOG.md
+        # Entry 3 showed that continuing to query after one failure can
+        # cascade into a fully wedged USBTMC session on real hardware.
         rm = _FakeRM()
         rm.inst.fail_commands = {":CHANnel1:COUPling?"}
         scope = ScopeReal(
@@ -223,8 +237,81 @@ class ScopeRealTests(unittest.TestCase):
 
         diagnostics = scope.capture_timeout_diagnostics()
 
-        self.assertIn("query failed", str(diagnostics.settings["ch1_coupling"]))
-        self.assertEqual(diagnostics.settings["trigger_mode"], "EDGE")
+        self.assertEqual(diagnostics.settings["ch1_display"], "1")  # queried before the failure
+        self.assertIn("query failed", str(diagnostics.settings["ch1_coupling"]))  # the failure itself
+        self.assertIn("diagnostics_aborted", diagnostics.settings)
+        self.assertNotIn("trigger_mode", diagnostics.settings)  # never reached - abort was immediate
+
+    def test_timeout_diagnostics_calls_device_clear_first(self) -> None:
+        rm = _FakeRM()
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        scope.capture_timeout_diagnostics()
+
+        self.assertEqual(rm.inst.clear_calls, 1)
+
+    def test_timeout_diagnostics_aborts_immediately_if_device_clear_fails(self) -> None:
+        rm = _FakeRM()
+        rm.inst.fail_clear = True
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+        )
+        scope.connect()
+
+        diagnostics = scope.capture_timeout_diagnostics()
+
+        self.assertEqual(rm.inst.clear_calls, 1)
+        self.assertEqual(set(diagnostics.settings.keys()), {"diagnostics_aborted"})
+        self.assertIn("device clear failed", diagnostics.settings["diagnostics_aborted"])
+        self.assertEqual(diagnostics.operation_condition, -1)
+        self.assertEqual(diagnostics.scope_png, b"")
+
+    def test_timeout_diagnostics_enforces_hard_per_query_timeout(self) -> None:
+        rm = _FakeRM()
+        rm.inst.slow_commands = {":CHANnel1:COUPling?": 2.0}
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=lambda: 5.0,
+            resource_manager_factory=lambda backend: rm,
+            diagnostics_query_timeout_s=0.05,
+        )
+        scope.connect()
+
+        started = time.monotonic()
+        diagnostics = scope.capture_timeout_diagnostics()
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)  # bounded by the 0.05s timeout, not the 2.0s sleep
+        self.assertIn("timed out", str(diagnostics.settings["ch1_coupling"]))
+
+    def test_timeout_diagnostics_respects_total_time_budget(self) -> None:
+        rm = _FakeRM()
+        clock = [5.0]
+
+        def monotonic() -> float:
+            value = clock[0]
+            clock[0] += 10.0  # every call jumps well past any reasonable budget
+            return value
+
+        scope = ScopeReal(
+            resource="USB::FAKE",
+            monotonic_now=monotonic,
+            resource_manager_factory=lambda backend: rm,
+            diagnostics_total_budget_s=1.0,
+        )
+        scope.connect()
+
+        diagnostics = scope.capture_timeout_diagnostics()
+
+        self.assertEqual(diagnostics.settings.get("diagnostics_aborted"), "total time budget exceeded")
+        self.assertNotIn("ch1_display", diagnostics.settings)
 
     def test_timeout_diagnostics_query_failure_does_not_trigger_reconnect(self) -> None:
         rm = _FakeRM()

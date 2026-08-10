@@ -144,6 +144,22 @@ class _FailingDiagnosticsScope(ScopeSim):
         raise RuntimeError("simulated diagnostics capture failure")
 
 
+class _RecordingDiagnosticsScope(ScopeSim):
+    """Records commanded contactor state at the moment diagnostics capture
+    is invoked - directly regression-tests the real incident
+    (SCOPE_TRIGGER_DEBUG_LOG.md Entry 3) where diagnostics ran while K1/K2
+    were still commanded closed."""
+
+    def __init__(self, *, contactors, scenario, monotonic_now) -> None:
+        super().__init__(scenario=scenario, monotonic_now=monotonic_now)
+        self._contactors = contactors
+        self.commanded_closed_at_diagnostics_time: dict | None = None
+
+    def capture_timeout_diagnostics(self) -> ScopeTimeoutDiagnostics:
+        self.commanded_closed_at_diagnostics_time = dict(self._contactors.snapshot().commanded_closed)
+        return super().capture_timeout_diagnostics()
+
+
 class _TwoHueCamera:
     """Always returns a genuinely two-hue (blue+red) frame, exercising the
     real per-frame >=2-hues BOOTING classification directly rather than
@@ -435,6 +451,26 @@ class SequencerTests(unittest.TestCase):
             "close_k3",
             [e.operation for e in events[last_open_k3_index + 1 :]],
         )
+
+    def test_diagnostics_capture_happens_only_after_full_safe_off(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        contactors = GpioSimContactorController(monotonic_now=self.clock.now)
+        scenario = self._scope_scenario(never_triggered=True)
+        scope = _RecordingDiagnosticsScope(contactors=contactors, scenario=scenario, monotonic_now=self.clock.now)
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+
+        sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertIsNotNone(scope.commanded_closed_at_diagnostics_time)
+        self.assertFalse(scope.commanded_closed_at_diagnostics_time[ContactorName.K1])
+        self.assertFalse(scope.commanded_closed_at_diagnostics_time[ContactorName.K2])
+        self.assertFalse(scope.commanded_closed_at_diagnostics_time[ContactorName.K3])
 
     def test_scope_consumed_before_injection_never_closes_k3(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)

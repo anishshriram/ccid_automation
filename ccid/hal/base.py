@@ -239,7 +239,9 @@ class ScopeInterface(ABC):
 
         Must never arm, trigger, run, or reconfigure the scope, and must
         never be treated as a completed acquisition. Only called after the
-        caller has already confirmed K3 is commanded open."""
+        caller has completed full safe-off (K1, K2, and K3 all commanded
+        open) - a hung/wedged diagnostics call must never be able to delay
+        de-energizing the EVSE mains."""
         pass
 
     @abstractmethod

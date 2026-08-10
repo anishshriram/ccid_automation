@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import queue
+import threading
 import time
 from typing import Callable, Mapping
 
@@ -49,6 +51,36 @@ def _as_float(text: str) -> float:
     return float(text.strip())
 
 
+def _run_with_timeout(action: Callable[[], object], timeout_s: float) -> tuple[object | None, str | None]:
+    """Runs `action` with a hard wall-clock bound via a daemon thread.
+
+    PyVISA's own configured instrument timeout did not reliably bound a
+    wedged USBTMC call in practice (see SCOPE_TRIGGER_DEBUG_LOG.md Entry 3:
+    a diagnostics call against a scope in a bad state appeared to hang and
+    required manual termination, then left the instrument unreachable
+    until a physical power cycle). A thread that never returns is
+    abandoned here - daemon=True means it cannot block process exit, but
+    the underlying I/O may still be stuck; this only bounds how long the
+    *caller* waits, it cannot force-unblock the transport.
+    """
+
+    box: queue.Queue = queue.Queue(maxsize=1)
+
+    def _run() -> None:
+        try:
+            box.put(("ok", action()))
+        except Exception as exc:
+            box.put(("error", str(exc)))
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_s)
+    if thread.is_alive():
+        return None, f"timed out after {timeout_s}s"
+    status, payload = box.get()
+    return (payload, None) if status == "ok" else (None, payload)
+
+
 class ScopeReal(ScopeInterface):
     """Keysight/USBTMC real scope implementation via PyVISA."""
 
@@ -60,12 +92,16 @@ class ScopeReal(ScopeInterface):
         monotonic_now: Callable[[], float] | None = None,
         resource_manager_factory=None,
         reconnect_attempts: int = 3,
+        diagnostics_query_timeout_s: float = 1.0,
+        diagnostics_total_budget_s: float = 5.0,
     ) -> None:
         self._resource_name = resource
         self._backend = backend
         self._now = monotonic_now or time.monotonic
         self._resource_manager_factory = resource_manager_factory
         self._reconnect_attempts = reconnect_attempts
+        self._diagnostics_query_timeout_s = diagnostics_query_timeout_s
+        self._diagnostics_total_budget_s = diagnostics_total_budget_s
         self._rm = None
         self._inst = None
         self._status = ScopeStatus.DISCONNECTED
@@ -198,10 +234,20 @@ class ScopeReal(ScopeInterface):
         # Deliberately bypasses `_query`/`_query_binary`/`_retry_io`: a scope
         # that just failed to report acquisition-complete is plausibly
         # wedged, and `_retry_io`'s reconnect-on-failure could add many
-        # seconds of blocking reconnect attempts across ~20 queries before
-        # K1/K2 ever open. Every query here is independently best-effort -
-        # one failed field must not discard the rest, and this method must
-        # never send a write/config/arm/trigger command.
+        # seconds of blocking reconnect attempts across ~20 queries.
+        #
+        # Fail-fast, not best-effort-per-field: SCOPE_TRIGGER_DEBUG_LOG.md
+        # Entry 3 shows that continuing to send further queries after one
+        # has already failed can cascade a single slow/failed query into a
+        # fully wedged USBTMC session (a stale unread response left in the
+        # instrument's output buffer desyncs every subsequent write/read
+        # pair) - recoverable, in that incident, only by physically
+        # power-cycling the scope. So the first failure here - including a
+        # failed device clear - aborts the whole capture immediately rather
+        # than pushing more queries into a connection that may already be
+        # unhealthy. Every single query is also individually bounded via
+        # `_run_with_timeout`, since PyVISA's own configured timeout did not
+        # reliably bound a wedged call in that incident.
         if self._inst is None:
             return ScopeTimeoutDiagnostics(
                 captured_at_utc=datetime.now(tz=timezone.utc),
@@ -214,27 +260,68 @@ class ScopeReal(ScopeInterface):
             )
 
         settings: dict[str, object] = {}
-        for key, command in _DIAGNOSTIC_SETTINGS_QUERIES:
-            settings[key] = self._diag_query(command)
-
         operation_condition = -1
-        raw_condition = self._diag_query(":OPERegister:CONDition?")
-        if not raw_condition.startswith("<query failed"):
-            try:
-                operation_condition = int(float(raw_condition))
-            except ValueError:
-                settings["operation_condition_parse_error"] = raw_condition
-
-        error_queue = self._drain_error_queue()
-
+        error_queue: tuple[str, ...] = ()
         scope_png = b""
-        try:
-            scope_png = self._inst.query_binary_values(
-                ":DISPlay:DATA? PNG", datatype="B", container=bytes
+        deadline = self._now() + self._diagnostics_total_budget_s
+
+        _, clear_error = _run_with_timeout(self._inst.clear, self._diagnostics_query_timeout_s)
+        if clear_error is not None:
+            settings["diagnostics_aborted"] = f"device clear failed, aborting: {clear_error}"
+            return ScopeTimeoutDiagnostics(
+                captured_at_utc=datetime.now(tz=timezone.utc),
+                captured_at_monotonic_s=self._now(),
+                operation_condition=-1,
+                hal_status=self._status.value,
+                settings=settings,
+                error_queue=(),
+                scope_png=b"",
             )
-            scope_png = bytes(scope_png)
-        except Exception as exc:
-            settings["scope_png_capture_error"] = f"<query failed: {exc}>"
+
+        aborted = False
+        for key, command in _DIAGNOSTIC_SETTINGS_QUERIES:
+            if self._now() >= deadline:
+                settings["diagnostics_aborted"] = "total time budget exceeded"
+                aborted = True
+                break
+            value, error = _run_with_timeout(
+                lambda c=command: self._inst.query(c), self._diagnostics_query_timeout_s
+            )
+            if error is not None:
+                settings[key] = f"<query failed: {error}>"
+                settings["diagnostics_aborted"] = f"aborted after failure on {command}: {error}"
+                aborted = True
+                break
+            settings[key] = str(value).strip()
+
+        if not aborted and self._now() < deadline:
+            value, error = _run_with_timeout(
+                lambda: self._inst.query(":OPERegister:CONDition?"), self._diagnostics_query_timeout_s
+            )
+            if error is not None:
+                settings["operation_condition_error"] = error
+                settings["diagnostics_aborted"] = "aborted after failure on :OPERegister:CONDition?"
+                aborted = True
+            else:
+                try:
+                    operation_condition = int(float(str(value).strip()))
+                except ValueError:
+                    settings["operation_condition_parse_error"] = str(value)
+
+        if not aborted and self._now() < deadline:
+            error_queue, drain_aborted = self._drain_error_queue_bounded(deadline)
+            if drain_aborted:
+                aborted = True
+
+        if not aborted and self._now() < deadline:
+            value, error = _run_with_timeout(
+                lambda: self._inst.query_binary_values(":DISPlay:DATA? PNG", datatype="B", container=bytes),
+                self._diagnostics_query_timeout_s,
+            )
+            if error is not None:
+                settings["scope_png_capture_error"] = f"<query failed: {error}>"
+            else:
+                scope_png = bytes(value)
 
         return ScopeTimeoutDiagnostics(
             captured_at_utc=datetime.now(tz=timezone.utc),
@@ -246,20 +333,21 @@ class ScopeReal(ScopeInterface):
             scope_png=scope_png,
         )
 
-    def _diag_query(self, command: str) -> str:
-        try:
-            return str(self._inst.query(command)).strip()
-        except Exception as exc:
-            return f"<query failed: {exc}>"
-
-    def _drain_error_queue(self) -> tuple[str, ...]:
+    def _drain_error_queue_bounded(self, deadline: float) -> tuple[tuple[str, ...], bool]:
         errors: list[str] = []
         for _ in range(_DIAGNOSTIC_ERROR_QUEUE_MAX_READS):
-            response = self._diag_query(":SYSTem:ERRor?")
-            if response.startswith("<query failed") or response.startswith("+0,"):
+            if self._now() >= deadline:
+                return tuple(errors), True
+            value, error = _run_with_timeout(
+                lambda: self._inst.query(":SYSTem:ERRor?"), self._diagnostics_query_timeout_s
+            )
+            if error is not None:
+                return tuple(errors), True
+            response = str(value).strip()
+            if response.startswith("+0,"):
                 break
             errors.append(response)
-        return tuple(errors)
+        return tuple(errors), False
 
     def status(self) -> ScopeStatus:
         return self._status

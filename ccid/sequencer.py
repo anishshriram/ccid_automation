@@ -439,8 +439,13 @@ class Sequencer:
         self._transition(context.transitions, cycle_index=cycle_index, state=CycleState.ACQUIRING)
         acquired = self._poll_acquisition_with_backstop(context=context, k3_closed_s=k3_closed_s)
         if not acquired:
-            self._capture_timeout_diagnostics_best_effort(context, run_dir=run_dir, run_id=run_id)
+            # Diagnostics must run strictly after full safe-off (K1+K2+K3
+            # all commanded open), not before - a hung/wedged diagnostics
+            # query must never delay de-energizing the EVSE mains. See
+            # SCOPE_TRIGGER_DEBUG_LOG.md Entry 3 for the incident that
+            # required this ordering.
             self._open_mains_with_cooldown(context, include_cooldown=False)
+            self._capture_timeout_diagnostics_best_effort(context, run_dir=run_dir, run_id=run_id)
             raise _SequencerHalt(
                 terminal=Terminal.RIG_FAULT,
                 category=FaultCategory.RIG,
@@ -513,8 +518,10 @@ class Sequencer:
     def _capture_timeout_diagnostics_best_effort(self, context: _CycleContext, *, run_dir, run_id: str) -> None:
         # Best-effort by design: an exception here must never prevent
         # safe-off or replace the primary halt reason (handoff safety
-        # invariants 3-4). K3 is already commanded open by the caller
-        # before this runs.
+        # invariants 3-4). Full safe-off (K1+K2+K3 all commanded open) has
+        # already completed by the time the caller invokes this - a hung
+        # diagnostics call must never be able to delay de-energizing the
+        # EVSE mains.
         self._transition(
             context.transitions,
             cycle_index=context.cycle_index,
