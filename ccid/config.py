@@ -78,7 +78,7 @@ _MODES_KEYS = frozenset({"gpio_mode", "scope_mode", "camera_mode"})
 _SUPPORTED_GPIO_MODES = frozenset({"real", "sim"})
 _PATHS_KEYS = frozenset({"run_root", "output_root", "min_free_disk_gb"})
 _CAMERA_KEYS = frozenset({"device_index"})
-_MONITORING_KEYS = frozenset({"heartbeat_url_env"})
+_MONITORING_KEYS = frozenset({"cronitor_url_env"})
 _ANALYSIS_KEYS = frozenset(
     {
         "algorithm_version",
@@ -139,7 +139,7 @@ class PathsConfig:
 
 @dataclass(frozen=True)
 class MonitoringConfig:
-    heartbeat_url_env: str | None
+    cronitor_url_env: str | None
 
 
 @dataclass(frozen=True)
@@ -177,10 +177,10 @@ class AppConfig:
         )
         return hashlib.sha256(encoded).hexdigest()
 
-    def resolve_heartbeat_url(self) -> str | None:
-        if self.monitoring.heartbeat_url_env is None:
+    def resolve_cronitor_url(self) -> str | None:
+        if self.monitoring.cronitor_url_env is None:
             return None
-        return os.environ.get(self.monitoring.heartbeat_url_env)
+        return os.environ.get(self.monitoring.cronitor_url_env)
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -291,11 +291,11 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
     min_free_disk_gb = _require_int(paths_map, "min_free_disk_gb", minimum=1)
     paths = PathsConfig(run_root=run_root, output_root=output_root, min_free_disk_gb=min_free_disk_gb)
 
-    heartbeat_url_env = monitoring_map.get("heartbeat_url_env")
-    if heartbeat_url_env is not None:
-        if not isinstance(heartbeat_url_env, str) or not heartbeat_url_env.strip():
-            raise ConfigValidationError("heartbeat_url_env must be a non-empty string when set")
-    monitoring = MonitoringConfig(heartbeat_url_env=heartbeat_url_env)
+    cronitor_url_env = monitoring_map.get("cronitor_url_env")
+    if cronitor_url_env is not None:
+        if not isinstance(cronitor_url_env, str) or not cronitor_url_env.strip():
+            raise ConfigValidationError("cronitor_url_env must be a non-empty string when set")
+    monitoring = MonitoringConfig(cronitor_url_env=cronitor_url_env)
 
     analysis = _build_analysis(
         raw.get("analysis"),
@@ -405,7 +405,7 @@ def _canonical_for_hash(config: AppConfig) -> dict[str, Any]:
             "min_free_disk_gb": config.paths.min_free_disk_gb,
         },
         # Keep only environment variable name in canonical hash; never secret value.
-        "monitoring": {"heartbeat_url_env": config.monitoring.heartbeat_url_env},
+        "monitoring": {"cronitor_url_env": config.monitoring.cronitor_url_env},
     }
 
 

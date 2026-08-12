@@ -3,7 +3,7 @@
 `start`/`resume`/`status`/`simulate` subcommands, signal-safe shutdown
 (SIGINT/SIGTERM request a safe stop rather than abandoning the run), systemd
 watchdog/notify integration, and best-effort outbound monitoring (ntfy +
-healthchecks.io) that can never itself halt a campaign - every outbound call
+Cronitor) that can never itself halt a campaign - every outbound call
 in `HttpNotifier` logs and swallows failures rather than raising. `SafeOff` is
 invoked on every lifecycle exit via `_execute_campaign`'s `finally` block,
 independent of how the campaign ended.
@@ -22,6 +22,7 @@ import signal
 import socket
 import time
 from typing import Callable, Sequence
+from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from ccid.config import AppConfig, load_config
@@ -152,15 +153,25 @@ class SystemdNotifier:
 
 
 class HttpNotifier:
+    """`cronitor_url` is a Cronitor telemetry ping URL
+
+    (`https://cronitor.link/p/<API_KEY>/<monitor-key>`, see
+    https://cronitor.io/docs/heartbeat-monitoring). A bare ping means "still
+    alive"; Cronitor's own configured expected-frequency alerting is the
+    dead-man's-switch (matches this project's prior healthchecks.io usage).
+    `?state=fail` is Cronitor's explicit failure signal. Cronitor discards
+    POST bodies, so all context travels in the query string via `message=`.
+    """
+
     def __init__(
         self,
         *,
-        heartbeat_url: str | None,
+        cronitor_url: str | None,
         ntfy_topic_url: str | None,
         opener: Callable[..., object] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
-        self._heartbeat_url = heartbeat_url
+        self._cronitor_url = cronitor_url
         self._ntfy_topic_url = ntfy_topic_url
         self._opener = opener or urlrequest.urlopen
         self._logger = logger or LOGGER
@@ -178,25 +189,31 @@ class HttpNotifier:
         self._notify_ntfy("CCID complete", f"run={run_id} cycles={cycle_target}")
 
     def heartbeat(self, run_id: str, last_completed_cycle: int) -> None:
-        if not self._heartbeat_url:
+        if not self._cronitor_url:
             return
+        query = urlparse.urlencode(
+            {"message": f"run_id={run_id} last_completed_cycle={last_completed_cycle}"}
+        )
         self._http_request(
-            self._heartbeat_url,
-            data=f"run_id={run_id}\nlast_completed_cycle={last_completed_cycle}\n".encode("utf-8"),
-            method="POST",
+            f"{self._cronitor_url}?{query}",
+            method="GET",
             failure_is_warning=True,
         )
 
     def heartbeat_fail(self, run_id: str, last_completed_cycle: int, reason: str) -> None:
-        if not self._heartbeat_url:
+        if not self._cronitor_url:
             return
-        url = self._heartbeat_url.rstrip("/") + "/fail"
+        query = urlparse.urlencode(
+            {
+                "state": "fail",
+                "message": (
+                    f"run_id={run_id} last_completed_cycle={last_completed_cycle} reason={reason}"
+                ),
+            }
+        )
         self._http_request(
-            url,
-            data=(
-                f"run_id={run_id}\nlast_completed_cycle={last_completed_cycle}\nreason={reason}\n"
-            ).encode("utf-8"),
-            method="POST",
+            f"{self._cronitor_url}?{query}",
+            method="GET",
             failure_is_warning=True,
         )
 
@@ -215,7 +232,7 @@ class HttpNotifier:
         self,
         url: str,
         *,
-        data: bytes,
+        data: bytes | None = None,
         method: str,
         headers: dict[str, str] | None = None,
         failure_is_warning: bool,
@@ -342,7 +359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     lifecycle = LifecycleSignals()
     watchdog = SystemdNotifier()
     notifier = HttpNotifier(
-        heartbeat_url=config.resolve_heartbeat_url(),
+        cronitor_url=config.resolve_cronitor_url(),
         ntfy_topic_url=os.environ.get(DEFAULT_NTFY_TOPIC_URL_ENV),
     )
     recorder = RunRecorder(config.paths.run_root, heartbeat_sender=notifier.heartbeat)

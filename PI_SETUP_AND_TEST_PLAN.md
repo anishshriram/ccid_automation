@@ -148,7 +148,7 @@ If you only have one USB webcam, it will normally be `/dev/video0`.
 Only needed once you're running real, unattended campaigns (Part 2, step 10+). Not required for anything earlier in this plan.
 
 ```bash
-export CCID_HEALTHCHECKS_URL="https://hc-ping.com/your-uuid"     # optional
+export CCID_CRONITOR_URL="https://cronitor.link/p/your-api-key/your-monitor-key"     # optional
 export CCID_NTFY_TOPIC_URL="https://ntfy.sh/your-topic"          # optional
 ```
 

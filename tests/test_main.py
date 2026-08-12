@@ -104,7 +104,7 @@ class MainTests(unittest.TestCase):
                   output_root: {self.root / 'runs'}
                   min_free_disk_gb: 2
                 monitoring:
-                  heartbeat_url_env: CCID_HEALTHCHECKS_URL
+                  cronitor_url_env: CCID_CRONITOR_URL
                 """
             ),
             encoding="utf-8",
@@ -138,8 +138,8 @@ class MainTests(unittest.TestCase):
             notifier.sleep(5.0)
         self.assertGreaterEqual(sent.count("WATCHDOG=1"), 2)
 
-    def test_http_notifier_heartbeat_fail_uses_fail_endpoint(self) -> None:
-        calls: list[str] = []
+    def test_http_notifier_heartbeat_pings_cronitor_with_no_state(self) -> None:
+        calls: list = []
 
         class _Resp:
             def __enter__(self):
@@ -150,16 +150,68 @@ class MainTests(unittest.TestCase):
 
         def opener(request, timeout=5):
             del timeout
-            calls.append(request.full_url)
+            calls.append(request)
             return _Resp()
 
         notifier = HttpNotifier(
-            heartbeat_url="https://hc-ping.example/abc",
+            cronitor_url="https://cronitor.link/p/key/ccid-endurance",
+            ntfy_topic_url=None,
+            opener=opener,
+        )
+        notifier.heartbeat("run1", 10)
+
+        self.assertEqual(len(calls), 1)
+        request = calls[0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertTrue(
+            request.full_url.startswith("https://cronitor.link/p/key/ccid-endurance?")
+        )
+        self.assertNotIn("state=", request.full_url)
+        self.assertIn("run_id%3Drun1", request.full_url)
+        self.assertIn("last_completed_cycle%3D10", request.full_url)
+
+    def test_http_notifier_heartbeat_fail_sets_cronitor_fail_state(self) -> None:
+        calls: list = []
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def opener(request, timeout=5):
+            del timeout
+            calls.append(request)
+            return _Resp()
+
+        notifier = HttpNotifier(
+            cronitor_url="https://cronitor.link/p/key/ccid-endurance",
             ntfy_topic_url=None,
             opener=opener,
         )
         notifier.heartbeat_fail("run1", 10, "fault")
-        self.assertEqual(calls, ["https://hc-ping.example/abc/fail"])
+
+        self.assertEqual(len(calls), 1)
+        request = calls[0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertTrue(
+            request.full_url.startswith("https://cronitor.link/p/key/ccid-endurance?")
+        )
+        self.assertIn("state=fail", request.full_url)
+        self.assertIn("reason%3Dfault", request.full_url)
+
+    def test_http_notifier_skips_cronitor_when_unconfigured(self) -> None:
+        calls: list = []
+
+        def opener(request, timeout=5):
+            del request, timeout
+            calls.append(1)
+
+        notifier = HttpNotifier(cronitor_url=None, ntfy_topic_url=None, opener=opener)
+        notifier.heartbeat("run1", 1)
+        notifier.heartbeat_fail("run1", 1, "fault")
+        self.assertEqual(calls, [])
 
     def test_cmd_start_initializes_run_then_executes(self) -> None:
         config_path = self._write_config()

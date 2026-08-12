@@ -36,7 +36,7 @@ CCID deployment notes
    - Do not commit this file.
    - Minimum variables:
        CCID_SCOPE_RESOURCE=USB0::0x0957::0x1798::MY58100795::INSTR
-       CCID_HEALTHCHECKS_URL=https://hc-ping.com/your-uuid
+       CCID_CRONITOR_URL=https://cronitor.link/p/your-api-key/your-monitor-key
    - Optional ntfy notification topic:
        CCID_NTFY_TOPIC_URL=https://ntfy.sh/your-topic
 

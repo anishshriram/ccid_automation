@@ -49,7 +49,7 @@ paths:
   min_free_disk_gb: 2
 
 monitoring:
-  heartbeat_url_env: CCID_HEALTHCHECKS_URL
+  cronitor_url_env: CCID_CRONITOR_URL
 
 # Trip-time analysis. The algorithm is deferred (handoff section 4), but the
 # measurement endpoints are not: UL 2231-2 section 23.3.1 is the authority, and

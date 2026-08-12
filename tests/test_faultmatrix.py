@@ -548,12 +548,12 @@ class FaultMatrixTests(unittest.TestCase):
         with self.assertRaises(ScopeRealError):
             scope.identify()
 
-    def test_healthcheck_request_failure_is_swallowed_row(self) -> None:
+    def test_cronitor_request_failure_is_swallowed_row(self) -> None:
         """A raising HTTP transport must be logged and swallowed, never
         propagated - monitoring can never halt the campaign."""
 
         notifier = HttpNotifier(
-            heartbeat_url="https://hc-ping.com/fake-uuid",
+            cronitor_url="https://cronitor.link/p/fake-key/fake-monitor",
             ntfy_topic_url="https://ntfy.sh/fake-topic",
             opener=_RaisingHttpOpener(),
         )
@@ -597,7 +597,7 @@ class FaultMatrixTests(unittest.TestCase):
     def test_missing_external_heartbeat_row(self) -> None:
         self.skipTest(
             "External-service behavior (coding_instructions.txt sec.7): a missing "
-            "heartbeat is detected by healthchecks.io's own grace-period timer, "
+            "heartbeat is detected by Cronitor's own expected-frequency alerting, "
             "not by this codebase, so it is documented rather than falsely "
             "unit-tested locally."
         )
