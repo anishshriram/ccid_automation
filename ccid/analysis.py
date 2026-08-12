@@ -78,9 +78,10 @@ class AnalysisVersion(str, Enum):
 
     V1 = "v1"
     V2 = "v2"
+    V3 = "v3"
 
 
-CURRENT_ANALYSIS_VERSION = AnalysisVersion.V2
+CURRENT_ANALYSIS_VERSION = AnalysisVersion.V3
 
 
 class Verdict(str, Enum):
@@ -124,7 +125,22 @@ V2_ENDPOINT_DEFINITION = (
     "trip_time_s = t_end - t0."
 )
 
-DEFAULT_ENDPOINT_DEFINITION = V2_ENDPOINT_DEFINITION
+V3_ENDPOINT_DEFINITION = (
+    "v3 endpoints: as v2, except detected-onset refinement below on_threshold "
+    "must also be confirmed against the raw samples themselves (a short "
+    "sustained run above the residual floor), not the forward-looking leading "
+    "envelope alone. Fixes a v2 defect: a single noisy or quantization-limited "
+    "sample crossing the residual floor could drag the refined onset back to an "
+    "unrelated point in the pre-trigger record, because the leading envelope "
+    "cannot distinguish an isolated sample from genuine sustained conduction "
+    "within one envelope window. v1 and v2 results already recorded under "
+    "those versions remain exactly as computed and are not retroactively "
+    "corrected; replay under v3 to get the corrected number for a given "
+    "waveform. "
+    "trip_time_s = t_end - t0."
+)
+
+DEFAULT_ENDPOINT_DEFINITION = V3_ENDPOINT_DEFINITION
 
 SANITY_SIGNAL_PRESENT = "signal_present"
 SANITY_NO_PRETRIGGER_LEAKAGE = "no_pretrigger_leakage"
@@ -776,6 +792,7 @@ def analyze_samples(
     if config.algorithm_version not in {
         AnalysisVersion.V1,
         AnalysisVersion.V2,
+        AnalysisVersion.V3,
     }:
         raise NotImplementedError(
             f"No implementation registered for {config.algorithm_version.value}; "
@@ -829,6 +846,7 @@ def analyze_samples(
             residual_floor=residual_floor,
             window=window,
             algorithm_version=config.algorithm_version,
+            sample_interval_s=dt,
         )
 
     t0, t0_source = _resolve_t0(
@@ -980,6 +998,15 @@ def _refine_end_index(
     return int(crossing_index + residual[-1])
 
 
+_ONSET_CONFIRMATION_S = 2e-6
+"""Minimum raw-sample run used to confirm a candidate onset (V3+).
+
+Far shorter than any real mains-frequency zero crossing, so it cannot delay
+detection of genuine conduction; long enough that a single noisy or
+quantization-limited sample crossing `residual_floor` cannot pass for it.
+"""
+
+
 def _refine_start_index(
     magnitude: np.ndarray,
     envelope_lead: np.ndarray,
@@ -988,6 +1015,7 @@ def _refine_start_index(
     residual_floor: float,
     window: int,
     algorithm_version: AnalysisVersion,
+    sample_interval_s: float = 0.0,
 ) -> int:
     """First conducting sample, recovered from the sub-threshold leading edge.
 
@@ -996,6 +1024,16 @@ def _refine_start_index(
     before the first conducting sample. Working from the envelope rather than
     from raw samples means an interior zero crossing cannot be mistaken for the
     start of the burst, which matters because K3 closes at a random phase.
+
+    Because the envelope is forward-looking, a single noisy or
+    quantization-limited raw sample crosses `residual_floor` just as
+    convincingly as genuine conduction -- the window "sees" it from up to one
+    window away, and if further noise samples follow within one window of each
+    other their shadows chain together, so nothing downstream flags it as
+    isolated (v2 defect, fixed in v3: see `V3_ENDPOINT_DEFINITION`). v3
+    confirms the candidate against the raw samples themselves (immune to that
+    forward-looking smear) before trusting it. v1 and v2 are frozen exactly as
+    originally shipped so historical results replay unchanged.
     """
 
     if burst_index <= 0 or magnitude.size == 0:
@@ -1007,15 +1045,20 @@ def _refine_start_index(
             # sample when no silent leading-envelope window is available.
             return 0
 
-        # V2 behavior: a forward-looking envelope can include a burst that
-        # begins shortly after the record starts. It therefore cannot prove
-        # conduction existed at the first sample
-        # V2 behavior: a forward-looking envelope can include a burst that
+        # V2/V3 behavior: a forward-looking envelope can include a burst that
         # begins shortly after the record starts. It therefore cannot prove
         # conduction existed at the first sample.
         return max(0, burst_index)
 
-    return int(min(burst_index, below[-1] + window))
+    candidate = int(min(burst_index, below[-1] + window))
+    if algorithm_version in (AnalysisVersion.V1, AnalysisVersion.V2):
+        return candidate
+
+    confirmation = max(1, int(round(_ONSET_CONFIRMATION_S / sample_interval_s))) if sample_interval_s > 0.0 else 1
+    confirmed = _first_sustained_low(
+        magnitude >= residual_floor, confirmation, start=candidate, limit=burst_index
+    )
+    return burst_index if confirmed is None else confirmed
 
 
 def _resolve_t0(

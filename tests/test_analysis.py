@@ -42,6 +42,7 @@ from ccid.analysis import (
     synthesize_burst_samples,
     synthesize_waveform_npz,
     V1_ENDPOINT_DEFINITION,
+    V2_ENDPOINT_DEFINITION,
 )
 from ccid.config import load_config
 from ccid.errors import WaveformFormatError
@@ -418,6 +419,53 @@ class NoiseAndEdgeCaseTests(unittest.TestCase):
         self.assertAlmostEqual(result.trip_time_s, 0.020, delta=CLEAN_TOLERANCE_S)
 
 
+class OnsetNoiseRobustnessTests(unittest.TestCase):
+    """Regression coverage for a real-hardware defect (25-cycle campaign,
+    cycles 1 and 17): scattered near-floor noise samples in the pre-trigger
+    buffer dragged the detected onset far ahead of the true burst, because
+    the forward-looking leading envelope cannot distinguish a lone noisy
+    sample from genuine sustained conduction -- both look identical for one
+    window's length. `_refine_start_index` must confirm a candidate against
+    the raw samples themselves before trusting it.
+    """
+
+    def test_scattered_pretrigger_noise_blips_do_not_drag_the_onset_backward(self) -> None:
+        samples, preamble = synthesize_burst_samples(
+            trip_time_s=0.020, pretrigger_s=0.030, record_after_t0_s=0.180
+        )
+        dt = preamble["x_increment"]
+        # Single-sample near-floor blips, spaced 4 ms apart (closer together
+        # than the 8.33 ms envelope window, so their forward shadows chain
+        # into one continuous "elevated" stretch reaching the real burst) --
+        # this is the exact pattern found in the real cycle 1 and 17 waveforms.
+        for blip_time_s in np.arange(-0.020, -0.003, 0.004):
+            index = int(round((blip_time_s - preamble["x_origin"]) / dt))
+            samples[index] = 5.0
+
+        result = analyze_waveform(pack_waveform_npz(samples, preamble), CONFIG)
+
+        self.assertAlmostEqual(result.trip_time_s, 0.020, delta=CLEAN_TOLERANCE_S)
+        self.assertEqual(result.verdict, Verdict.PASS)
+        self.assertTrue(result.sanity_checks[SANITY_COLLAPSE_IS_CLEAN])
+
+    def test_genuine_sub_threshold_ramp_before_t0_is_still_recovered(self) -> None:
+        samples, preamble = synthesize_burst_samples(
+            pretrigger_s=0.020, record_after_t0_s=0.180, trip_time_s=0.015
+        )
+        dt = float(preamble["x_increment"])
+        times = float(preamble["x_origin"]) + np.arange(samples.size) * dt
+        # Genuine conduction (real sine, not an isolated sample) starting
+        # 5 ms before the nominal t0 and running through the burst.
+        burst = 170.0 * np.sin(2.0 * np.pi * 60.0 * times)
+        samples = np.where((times >= -0.005) & (times <= 0.015), burst, 0.0)
+
+        result = analyze_waveform(pack_waveform_npz(samples, preamble), CONFIG)
+
+        self.assertIn("t0_source=detected_onset", result.notes)
+        self.assertAlmostEqual(result.trip_time_s, 0.020, delta=CLEAN_TOLERANCE_S)
+        self.assertEqual(result.verdict, Verdict.PASS)
+
+
 class TimeBaseTests(unittest.TestCase):
     def test_sidecar_injection_time_shifts_the_measurement(self) -> None:
         payload = waveform_bytes(trip_time_s=0.020)
@@ -527,16 +575,16 @@ class VersioningTests(unittest.TestCase):
             CONFIG,
         )
 
-        self.assertEqual(result.algorithm_version, AnalysisVersion.V2)
-        self.assertEqual(CURRENT_ANALYSIS_VERSION, AnalysisVersion.V2)
-        self.assertEqual(result.algorithm_version.value, "v2")
-        self.assertIn("analysis_version=v2", result.notes)
+        self.assertEqual(result.algorithm_version, AnalysisVersion.V3)
+        self.assertEqual(CURRENT_ANALYSIS_VERSION, AnalysisVersion.V3)
+        self.assertEqual(result.algorithm_version.value, "v3")
+        self.assertIn("analysis_version=v3", result.notes)
 
     def test_an_unimplemented_future_version_refuses_to_analyse(self) -> None:
         class FutureVersion(str, Enum):
-            V3 = "v3"
+            V4 = "v4"
 
-        future_config = replace(CONFIG, algorithm_version=FutureVersion.V3)
+        future_config = replace(CONFIG, algorithm_version=FutureVersion.V4)
         waveform = load_waveform(waveform_bytes(trip_time_s=0.010))
         with self.assertRaises(NotImplementedError):
             analyze_samples(waveform, future_config)
@@ -546,7 +594,7 @@ class VersioningTests(unittest.TestCase):
         payload = json.loads(json.dumps(result.to_dict()))
         restored = TripResult.from_dict(payload)
         self.assertEqual(restored, result)
-        self.assertEqual(restored.algorithm_version, AnalysisVersion.V2)
+        self.assertEqual(restored.algorithm_version, AnalysisVersion.V3)
 
     def test_historical_v1_remains_replayable(self) -> None:
         v1_config = replace(
@@ -562,6 +610,32 @@ class VersioningTests(unittest.TestCase):
         self.assertEqual(result.algorithm_version, AnalysisVersion.V1)
         self.assertIn("analysis_version=v1", result.notes)
         self.assertIn("endpoints=v1 endpoints:", result.notes)
+
+    def test_historical_v2_remains_replayable_with_its_known_onset_defect(self) -> None:
+        # Regression guard for the fix itself: v2 must keep reproducing its own
+        # recorded (buggy) numbers on replay, never silently pick up the v3
+        # correction. See OnsetNoiseRobustnessTests for the v3 behavior on the
+        # same kind of waveform.
+        samples, preamble = synthesize_burst_samples(
+            trip_time_s=0.020, pretrigger_s=0.030, record_after_t0_s=0.180
+        )
+        dt = preamble["x_increment"]
+        for blip_time_s in np.arange(-0.020, -0.003, 0.004):
+            index = int(round((blip_time_s - preamble["x_origin"]) / dt))
+            samples[index] = 5.0
+
+        v2_config = replace(
+            CONFIG,
+            algorithm_version=AnalysisVersion.V2,
+            endpoint_definition=V2_ENDPOINT_DEFINITION,
+        )
+        result = analyze_waveform(pack_waveform_npz(samples, preamble), v2_config)
+
+        self.assertEqual(result.algorithm_version, AnalysisVersion.V2)
+        self.assertIn("analysis_version=v2", result.notes)
+        # The known v2 defect: the onset is dragged back to the first blip
+        # instead of the real burst, inflating the trip time by ~17 ms.
+        self.assertAlmostEqual(result.trip_time_s, 0.040, delta=CLEAN_TOLERANCE_S)
 
     def test_malformed_sidecar_payloads_are_rejected(self) -> None:
         with self.assertRaises(WaveformFormatError):
@@ -654,7 +728,7 @@ class AnalysisConfigTests(unittest.TestCase):
     def test_config_yaml_freezes_the_endpoint_definition(self) -> None:
         app_config = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
         self.assertEqual(app_config.analysis.endpoint_definition, DEFAULT_ENDPOINT_DEFINITION)
-        self.assertEqual(app_config.analysis.algorithm_version, AnalysisVersion.V2)
+        self.assertEqual(app_config.analysis.algorithm_version, AnalysisVersion.V3)
         self.assertAlmostEqual(app_config.analysis.pass_limit_s, app_config.timing.pass_limit_s)
         self.assertAlmostEqual(
             app_config.analysis.no_trip_limit_s, app_config.timing.no_trip_limit_s

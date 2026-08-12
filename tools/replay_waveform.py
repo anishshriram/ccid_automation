@@ -39,6 +39,7 @@ from ccid.analysis import (
     resolve_analysis_config,
     V1_ENDPOINT_DEFINITION,
     V2_ENDPOINT_DEFINITION,
+    V3_ENDPOINT_DEFINITION,
 )
 from ccid.config import load_config
 from ccid.errors import WaveformFormatError
@@ -74,20 +75,22 @@ def resolve_algorithm_version(text: str | None) -> AnalysisVersion | None:
         raise ValueError(f"Unsupported algorithm_version '{text}'; supported: {supported}") from exc
 
 
+_ENDPOINT_DEFINITION_BY_VERSION = {
+    AnalysisVersion.V1: V1_ENDPOINT_DEFINITION,
+    AnalysisVersion.V2: V2_ENDPOINT_DEFINITION,
+    AnalysisVersion.V3: V3_ENDPOINT_DEFINITION,
+}
+
+
 def build_analysis_config(config_path: str | Path, algorithm_version: str | None) -> AnalysisConfig:
     app_config = load_config(config_path)
     analysis_config = resolve_analysis_config(app_config)
     version = resolve_algorithm_version(algorithm_version)
     if version is not None:
-        endpoint_definition = (
-            V1_ENDPOINT_DEFINITION
-            if version is AnalysisVersion.V1
-            else V2_ENDPOINT_DEFINITION
-        )
         analysis_config = replace(
             analysis_config,
             algorithm_version=version,
-            endpoint_definition=endpoint_definition,
+            endpoint_definition=_ENDPOINT_DEFINITION_BY_VERSION[version],
         )
     return analysis_config
 
