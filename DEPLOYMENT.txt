@@ -22,16 +22,7 @@ CCID deployment notes
        sudo usermod -a -G plugdev ccid
    - On Raspberry Pi, ensure gpiozero uses lgpio on target
 
-4. systemd watchdog
-   - In /etc/systemd/system.conf set:
-       RuntimeWatchdogSec=10
-       RebootWatchdogSec=60
-   - Install deploy/ccid-automation.service into /etc/systemd/system/
-   - Reload and enable:
-       sudo systemctl daemon-reload
-       sudo systemctl enable ccid-automation.service
-
-5. Secrets and environment injection
+4. Secrets and environment injection
    - Create /etc/default/ccid-automation with the environment variables below.
    - Do not commit this file.
    - Minimum variables:
@@ -40,13 +31,24 @@ CCID deployment notes
    - Optional ntfy notification topic:
        CCID_NTFY_TOPIC_URL=https://ntfy.sh/your-topic
 
-6. Service operation
-   - Start a brand new run manually:
+5. Start the first run manually, before touching systemd
+   - The service unit (step 6) always runs `resume --latest`, which requires an
+     existing run directory. Enabling it before any run exists will crash-loop.
+     Start one run manually first:
        /opt/ccid/venv/bin/python -m ccid.main --config /opt/ccid/config.yaml start
-   - Resume the latest run manually:
+   - Resume the latest run manually, if needed:
        /opt/ccid/venv/bin/python -m ccid.main --config /opt/ccid/config.yaml resume --latest
    - Query safe status:
        /opt/ccid/venv/bin/python -m ccid.main --config /opt/ccid/config.yaml status --latest
+
+6. systemd watchdog
+   - In /etc/systemd/system.conf set:
+       RuntimeWatchdogSec=10
+       RebootWatchdogSec=60
+   - Install deploy/ccid-automation.service into /etc/systemd/system/
+   - Reload and enable (only after step 5 has created a run directory):
+       sudo systemctl daemon-reload
+       sudo systemctl enable ccid-automation.service
 
 7. Safety and commissioning reminders
    - Safe software behavior is not a substitute for ground bonding, flyback diodes,
