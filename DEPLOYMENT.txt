@@ -50,6 +50,31 @@ CCID deployment notes
        sudo systemctl daemon-reload
        sudo systemctl enable ccid-automation.service
 
+6a. Persistent journald (required before another unattended endurance campaign)
+   - By default journald keeps logs only in a small volatile ring buffer
+     (/run/log/journal), which is lost on reboot or power loss - this is exactly
+     what happened in campaign 5800_v3_real_20260813T175531Z: the Pi became
+     unreachable after halting at cycle 38, and the original traceback for
+     halt_reason=controller:unexpected:ValueError was lost with the reboot,
+     leaving only a theory instead of a confirmed root cause.
+   - Make journald persistent across reboots:
+       sudo mkdir -p /var/log/journal
+       sudo systemd-tmpfiles --create --prefix /var/log/journal
+   - In /etc/systemd/journald.conf set:
+       Storage=persistent
+       SystemMaxUse=500M
+   - Restart the journal service to apply:
+       sudo systemctl restart systemd-journald
+   - Verify persistence survives a reboot before trusting it on a real campaign:
+       sudo reboot
+       journalctl --list-boots        # more than one boot should be listed
+   - This is a mitigation, not a substitute for the durable per-cycle diagnostics
+     Sequencer._capture_controller_exception_diagnostics() now writes directly
+     under runs/<run_id>/diagnostics/<cycle_index>/controller_exception.json for
+     any unexpected controller exception - that artifact survives even if
+     journald itself is lost, since it's fsync'd to the run directory as part
+     of the normal halt path, not routed through the system logger at all.
+
 7. Safety and commissioning reminders
    - Safe software behavior is not a substitute for ground bonding, flyback diodes,
      gate pulldowns, correct wiring, restricted access, and staged commissioning.

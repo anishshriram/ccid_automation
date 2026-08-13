@@ -23,6 +23,7 @@ import io
 import json
 import logging
 import shutil
+import traceback
 import zipfile
 from typing import Callable, Mapping
 
@@ -305,7 +306,8 @@ class Sequencer:
                     reason=f"rig_error:{type(exc).__name__}",
                 )
                 return execution, self._mark_halt_state(run_dir, state, execution), context.transitions
-            except Exception as exc:  # pragma: no cover - defensive safety net
+            except Exception as exc:  # defensive safety net - see test_unexpected_controller_exception_persists_full_diagnostics
+                self._capture_controller_exception_diagnostics(context, run_dir=run_dir, run_id=state.run_id, exc=exc)
                 execution = self._halt_without_capture(
                     context,
                     terminal=Terminal.HALTED,
@@ -649,9 +651,25 @@ class Sequencer:
                         self._record_diagnostic_stage(context, "acquisition_completion_observed")
                 self._sleep(0.01)
                 continue
-            if self._scope.wait_until_acquisition_complete(
-                timeout_s=min(0.01, acq_timeout_s - (now_s - start_s)),
-                now_monotonic_s=now_s,
+            # `remaining_s` must be computed fresh, immediately before this
+            # call, and the HAL must never be called when it isn't strictly
+            # positive - wait_until_acquisition_complete() raises ValueError
+            # for timeout_s <= 0. The previous version derived this from the
+            # `now_s` read at the top of the loop body, one line before a
+            # `while ... <= acq_timeout_s` guard that is itself boundary-
+            # inclusive: two independent monotonic reads a moment apart,
+            # straddling an inclusive deadline, can let remaining time reach
+            # zero or go slightly negative between them under real scheduling
+            # jitter - reachable rarely enough to surface once in many
+            # thousands of cycles rather than every time. Falling through
+            # here (no HAL call) is safe: the loop's own timeout/backstop
+            # paths below still fire on the next iteration or after this one
+            # exits, exactly as an ordinary acquisition timeout would.
+            poll_now_s = self._now()
+            remaining_s = acq_timeout_s - (poll_now_s - start_s)
+            if remaining_s > 0 and self._scope.wait_until_acquisition_complete(
+                timeout_s=min(0.01, remaining_s),
+                now_monotonic_s=poll_now_s,
             ):
                 if not opened:
                     self._transition(
@@ -961,6 +979,46 @@ class Sequencer:
             latch_slow_clear=context.latch_slow_clear,
         )
         return execution, next_state, context.transitions
+
+    def _capture_controller_exception_diagnostics(
+        self,
+        context: _CycleContext,
+        *,
+        run_dir,
+        run_id: str,
+        exc: Exception,
+    ) -> None:
+        """Best-effort: persist full exception detail before the caller
+        collapses it into `unexpected:{type(exc).__name__}`. Must never
+        raise - this runs inside the sequencer's last-resort exception
+        handler, which cannot tolerate a second failure masking the first.
+        """
+        try:
+            self._recorder.write_controller_exception_diagnostics(
+                run_dir=run_dir,
+                run_id=run_id,
+                cycle_index=context.cycle_index,
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                traceback_text="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                last_state=context.transitions[-1].state.value if context.transitions else None,
+                transitions=[
+                    {
+                        "cycle_index": t.cycle_index,
+                        "state": t.state.value,
+                        "at_monotonic_s": t.at_monotonic_s,
+                        "detail": t.detail,
+                    }
+                    for t in context.transitions
+                ],
+                captured_at_monotonic_s=self._now(),
+                cycle_monotonic_start_s=context.monotonic_start,
+            )
+        except Exception:
+            self._logger.exception(
+                "Failed to persist controller exception diagnostics for cycle %s",
+                context.cycle_index,
+            )
 
     def _halt_without_capture(
         self,

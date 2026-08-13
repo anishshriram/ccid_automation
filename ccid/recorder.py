@@ -380,6 +380,60 @@ class RunRecorder:
             },
         )
 
+    def write_controller_exception_diagnostics(
+        self,
+        *,
+        run_dir: Path,
+        run_id: str,
+        cycle_index: int,
+        exception_type: str,
+        exception_message: str,
+        traceback_text: str,
+        last_state: str | None,
+        transitions: Sequence[Mapping[str, object]],
+        captured_at_monotonic_s: float,
+        cycle_monotonic_start_s: float,
+    ) -> None:
+        """Best-effort evidence capture for a `controller:unexpected:*` halt.
+
+        Sequencer._run_cycle's defensive catch-all previously recorded only
+        `type(exc).__name__` in the halt reason - the exception message and
+        traceback went nowhere but process stderr/journald, which is not
+        guaranteed durable. That gap is exactly what turned a real defect
+        into an unproven theory in campaign `5800_v3_real_20260813T175531Z`:
+        the Pi became unreachable after halting at cycle 38, and non-
+        persistent journald lost the original traceback when it was power-
+        cycled. This method exists so the next unexpected controller
+        exception - whatever it turns out to be - leaves durable evidence
+        even if the process or the host doesn't survive to report it live.
+
+        Like `write_timeout_diagnostics`/`write_forced_diagnostic_capture`:
+        outside the crash-safe commit contract described in this module's
+        docstring - writes only under diagnostics/<cycle_index>/, never
+        touches runstate.json, cycles.csv, or last_completed_cycle. Must
+        never raise into the caller; the caller is itself the last-resort
+        exception handler and cannot tolerate a second failure here masking
+        the original one.
+        """
+
+        diag_dir = run_dir / "diagnostics" / str(cycle_index)
+        self._write_json_and_fsync(
+            diag_dir / "controller_exception.json",
+            {
+                "run_id": run_id,
+                "cycle_index": cycle_index,
+                "software_version": __version__,
+                "captured_at_monotonic_s": captured_at_monotonic_s,
+                "cycle_monotonic_start_s": cycle_monotonic_start_s,
+                "elapsed_in_cycle_s": captured_at_monotonic_s - cycle_monotonic_start_s,
+                "exception_type": exception_type,
+                "exception_message": exception_message,
+                "traceback": traceback_text,
+                "last_state": last_state,
+                "transitions": list(transitions),
+            },
+        )
+
     def _checkpoint(self, step_name: str) -> None:
         if self._crash_injector is not None:
             self._crash_injector(step_name)

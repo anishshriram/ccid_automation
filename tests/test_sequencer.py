@@ -266,6 +266,105 @@ class _TriggerEventAppearsBetweenBaselineReadsScope(ScopeSim):
         return self._ter_calls >= 2
 
 
+class _AcquisitionDeadlineClock:
+    """A manual clock that also supports queuing a short, fixed sequence of
+    upcoming `.now()` return values ("arm"). An ordinary `_ManualClock`
+    never advances between two `.now()` calls unless `.sleep()` runs in
+    between, so it cannot naturally reproduce two consecutive reads landing
+    on opposite sides of a deadline - the exact condition
+    `Sequencer._poll_acquisition_with_backstop`'s boundary guard exists to
+    handle (5800_v3_real_20260813T175531Z, cycle 38). Once armed, each
+    queued value both is returned *and* becomes the clock's new persistent
+    time, so later `.sleep()` calls correctly continue from wherever the
+    queue left off rather than "rewinding.\""""
+
+    def __init__(self, start_s: float = 0.0) -> None:
+        self.now_s = start_s
+        self._queue: list[float] = []
+
+    def now(self) -> float:
+        if self._queue:
+            self.now_s = self._queue.pop(0)
+        return self.now_s
+
+    def sleep(self, seconds: float) -> None:
+        self.now_s += max(0.0, seconds)
+
+    def arm(self, values: list[float]) -> None:
+        self._queue = list(values)
+
+
+class _AcquisitionTimeoutBoundaryScope(ScopeSim):
+    """Reproduces the timeout-boundary defect fixed in
+    `Sequencer._poll_acquisition_with_backstop`: `remaining_s` must never
+    let a zero/negative value reach `wait_until_acquisition_complete`,
+    which raises `ValueError("timeout_s must be > 0")` for that condition
+    exactly like the real driver (`ScopeReal`) does.
+
+    TER-sequenced like `_TriggeredButNeverCompletesScope` - a real trigger
+    already occurred (forcing is correctly skipped, per Entry 15) but the
+    acquisition itself never completes - because that is the only branch
+    where the loop keeps normal-polling all the way to the acquisition
+    timeout at all; once a diagnostic trigger is actually forced, the loop
+    permanently stops calling `wait_until_acquisition_complete` for the
+    rest of the cycle (SCOPE_TRIGGER_DEBUG_LOG.md Entry 11).
+
+    Once K3 has opened via its own 300 ms backstop, arms the clock's next
+    few reads to straddle the acquisition deadline by `read_offsets_s`
+    (computed relative to the real `close_k3` event's timestamp, not a
+    hand-counted call number, so this doesn't depend on exactly how many
+    `self._now()` calls happen earlier in the cycle).
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: _AcquisitionDeadlineClock,
+        contactors,
+        scenario: ScopeSimScenario,
+        acq_timeout_s: float,
+        read_offsets_s: list[float],
+    ) -> None:
+        super().__init__(scenario=scenario, monotonic_now=clock.now)
+        self._clock = clock
+        self._contactors = contactors
+        self._acq_timeout_s = acq_timeout_s
+        self._read_offsets_s = read_offsets_s
+        self._ter_calls = 0
+        self._armed = False
+        self.acquisition_calls = 0
+        self.calls_with_nonpositive_timeout = 0
+
+    def read_trigger_event_register(self) -> bool:
+        self._ter_calls += 1
+        return self._ter_calls > 3
+
+    def wait_until_acquisition_complete(self, timeout_s: float, now_monotonic_s: float) -> bool:
+        self.acquisition_calls += 1
+        if timeout_s <= 0.0:
+            self.calls_with_nonpositive_timeout += 1
+            raise ValueError("timeout_s must be > 0")
+        if not self._armed and not self._contactors.snapshot().commanded_closed[ContactorName.K3]:
+            self._armed = True
+            close_k3_event = next(
+                event for event in self._contactors.events() if event.operation == "close_k3"
+            )
+            deadline_s = close_k3_event.monotonic_s + self._acq_timeout_s
+            self._clock.arm([deadline_s + offset for offset in self._read_offsets_s])
+        return False
+
+
+class _UnexpectedControllerExceptionScope(ScopeSim):
+    """Raises an arbitrary, otherwise-unclassified exception during
+    configuration - exercises Sequencer._run_cycle's defensive
+    `except Exception` catch-all, the same handler
+    `controller:unexpected:ValueError` came from in
+    5800_v3_real_20260813T175531Z."""
+
+    def configure_for_cycle(self, settings) -> None:
+        raise RuntimeError("simulated unexpected controller failure")
+
+
 class _TwoHueCamera:
     """Always returns a genuinely two-hue (blue+red) frame, exercising the
     real per-frame >=2-hues BOOTING classification directly rather than
@@ -999,6 +1098,105 @@ class SequencerTests(unittest.TestCase):
         )
         self.assertEqual(diag["k3_open_reason"], "backstop")
         self.assertAlmostEqual(diag["k3_duration_s"], k3_duration_s, places=6)
+
+    def _run_acquisition_deadline_boundary_case(self, *, read_offsets_s: list[float]):
+        """Shared setup for the two boundary regression tests below - only
+        `read_offsets_s` differs between the exact-zero and
+        slightly-negative cases."""
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        clock = _AcquisitionDeadlineClock()
+        self.clock = clock
+        contactors = GpioSimContactorController(monotonic_now=clock.now)
+        scenario = self._scope_scenario(never_triggered=True)
+        scope = _AcquisitionTimeoutBoundaryScope(
+            clock=clock,
+            contactors=contactors,
+            scenario=scenario,
+            acq_timeout_s=self.base_config.timing.scope_acquisition_timeout_s,
+            read_offsets_s=read_offsets_s,
+        )
+        sequencer = self._make_sequencer(
+            camera=camera,
+            scope_scenario=scenario,
+            contactors=contactors,
+            scope=scope,
+        )
+        result = sequencer.run(run_dir=run_dir, state=state)
+        return result, contactors, scope
+
+    def test_acquisition_deadline_exact_zero_remaining_never_calls_hal_with_nonpositive_timeout(
+        self,
+    ) -> None:
+        # All three of the loop's `self._now()` reads for the boundary
+        # iteration land exactly at the deadline: remaining_s computes to
+        # precisely 0.0, which must be treated as "not > 0," not as "close
+        # enough to poll."
+        result, contactors, scope = self._run_acquisition_deadline_boundary_case(
+            read_offsets_s=[0.0, 0.0, 0.0]
+        )
+
+        self.assertEqual(scope.calls_with_nonpositive_timeout, 0)
+        self.assertNotEqual(result.halt_reason, "controller:unexpected:ValueError")
+        self.assertIn(result.terminal, (Terminal.RIG_FAULT, Terminal.HALTED))
+
+        # `safe_off()` unconditionally re-issues open commands on every
+        # invocation (idempotent by design - see ccid/safety.py), so more
+        # than one "open_k3" event across the full halt/safe-off cascade is
+        # normal and safe, not a defect. What must hold is that K3's *first*
+        # open happened safely, via the 300ms backstop - not delayed all
+        # the way to the (now-guarded) acquisition-timeout boundary this
+        # test deliberately engineers.
+        events = contactors.events()
+        close_k3 = next(e for e in events if e.operation == "close_k3")
+        first_open_k3 = next(e for e in events if e.operation == "open_k3" and e.monotonic_s >= close_k3.monotonic_s)
+        k3_duration_s = first_open_k3.monotonic_s - close_k3.monotonic_s
+        self.assertLessEqual(k3_duration_s, self.base_config.timing.k3_backstop_s + 0.02)
+
+    def test_acquisition_deadline_slightly_negative_remaining_never_calls_hal_with_nonpositive_timeout(
+        self,
+    ) -> None:
+        # The guard's own `while ... <= acq_timeout_s` read still passes
+        # (right at the deadline), but the loop body's fresh reads land a
+        # couple of milliseconds past it - the exact "two independent
+        # monotonic reads straddling an inclusive boundary" mechanism
+        # behind cycle 38's halt_reason=controller:unexpected:ValueError.
+        result, contactors, scope = self._run_acquisition_deadline_boundary_case(
+            read_offsets_s=[0.0, 0.002, 0.002]
+        )
+
+        self.assertEqual(scope.calls_with_nonpositive_timeout, 0)
+        self.assertNotEqual(result.halt_reason, "controller:unexpected:ValueError")
+        self.assertIn(result.terminal, (Terminal.RIG_FAULT, Terminal.HALTED))
+
+        events = contactors.events()
+        close_k3 = next(e for e in events if e.operation == "close_k3")
+        first_open_k3 = next(e for e in events if e.operation == "open_k3" and e.monotonic_s >= close_k3.monotonic_s)
+        k3_duration_s = first_open_k3.monotonic_s - close_k3.monotonic_s
+        self.assertLessEqual(k3_duration_s, self.base_config.timing.k3_backstop_s + 0.02)
+
+    def test_unexpected_controller_exception_persists_full_diagnostics(self) -> None:
+        run_dir, state = self._initialize(target_cycles=1)
+        camera = _ScriptedCamera([LedState.CHARGING] * 120)
+        scenario = self._scope_scenario(trip_time_s=0.010)
+        scope = _UnexpectedControllerExceptionScope(scenario=scenario, monotonic_now=self.clock.now)
+        sequencer = self._make_sequencer(camera=camera, scope_scenario=scenario, scope=scope)
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.halt_reason, "controller:unexpected:RuntimeError")
+        diag_path = run_dir / "diagnostics" / "1" / "controller_exception.json"
+        self.assertTrue(diag_path.exists())
+        diag = json.loads(diag_path.read_text(encoding="utf-8"))
+        self.assertEqual(diag["exception_type"], "RuntimeError")
+        self.assertEqual(diag["exception_message"], "simulated unexpected controller failure")
+        self.assertIn("simulated unexpected controller failure", diag["traceback"])
+        self.assertIn("Traceback (most recent call last)", diag["traceback"])
+        self.assertEqual(diag["cycle_index"], 1)
+        self.assertIsInstance(diag["transitions"], list)
+        self.assertGreater(len(diag["transitions"]), 0)
+        self.assertIn("captured_at_monotonic_s", diag)
+        self.assertIn("cycle_monotonic_start_s", diag)
 
     def test_pretrigger_leakage_halts_as_rig_fault(self) -> None:
         run_dir, state = self._initialize(target_cycles=1)
