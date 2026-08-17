@@ -1,6 +1,6 @@
 # Sequencer & State Machine
 
-**Source files:** `ccid/sequencer.py` (1126 lines), `ccid/states.py` (53 lines), `ccid/safety.py` (42 lines)
+**Source files:** `ccid/sequencer.py` (1265 lines), `ccid/states.py` (53 lines), `ccid/safety.py` (42 lines)
 **Tests:** `tests/test_sequencer.py` (1077 lines, class `SequencerTests`), `tests/test_faultmatrix.py` (class `FaultMatrixTests`, one test per fault-matrix row), `tests/test_safety.py`
 
 This is the core of the whole system. Every other module (`analysis.py`, `classify.py`, the HAL, `recorder.py`) exists to be *called by* this one. If you only ever read one file to understand how the rig behaves, read this one.
@@ -238,6 +238,23 @@ Only two operations happen inside the live acquisition window here: one `:TER?` 
 
 `context.live_trigger_event_seen` is set here specifically because `:TER?` is read-and-clear: if a real trigger is found at this checkpoint, that fact would otherwise be lost the moment anything else reads `:TER?` again (including the post-timeout diagnostics bundle's own query). This flag is the only durable record of it, and it's what lets `_capture_timeout_diagnostics_best_effort` (§8.2) later choose the correct, more specific halt reason.
 
+#### 5.7.3 The timeout-boundary `ValueError` bug and its fix
+
+A second real bug in this same loop, found the same way as the Entry 15 bug above — by writing a regression test against a real reported incident, not by inspection. Leading hypothesis (unconfirmed as the definitive cause, since the original traceback was lost — see the persistence doc's controller-exception-diagnostics section for why that gap itself got closed) for `halt_reason=controller:unexpected:ValueError` at cycle 38 of campaign `5800_v3_real_20260813T175531Z`:
+
+```python
+poll_now_s = self._now()
+remaining_s = acq_timeout_s - (poll_now_s - start_s)
+if remaining_s > 0 and self._scope.wait_until_acquisition_complete(
+    timeout_s=min(0.01, remaining_s),
+    now_monotonic_s=poll_now_s,
+):
+```
+
+`ScopeReal.wait_until_acquisition_complete()` (and `ScopeSim`'s identical check) raises `ValueError("timeout_s must be > 0")` for `timeout_s <= 0`. The **old** version computed the passed timeout from `now_s`, a value read once at the *top* of the loop body — one line before the `while self._now() - start_s <= acq_timeout_s:` guard, which is itself boundary-inclusive (`<=`). Two independent monotonic reads a moment apart, straddling an inclusive deadline: if the guard passes right at the edge, real scheduling jitter (GIL contention, GC, actual USBTMC/GPIO I/O happening in the same process) can let monotonic time tick past the deadline before the second read, making the computed remaining value already zero or negative — reachable rarely enough to surface once in many thousands of cycles rather than every time, consistent with this showing up once at cycle 38 rather than immediately. Note this is *not* a race caused by a slow intervening HAL call as such a call might first suggest — the calls between the two reads (the forced-diagnostic checkpoint, the K3-backstop check) all happen *after* `now_s` is already fixed and can only delay reaching the already-decided call, not change what value it was given.
+
+Fixed by computing `remaining_s` fresh, immediately before the call (`poll_now_s`, not the stale `now_s`), and never calling the HAL at all when it isn't strictly positive — the loop just falls through to `self._sleep(0.01)` and lets the existing backstop/timeout paths handle it on the next iteration or after this one exits, exactly as an ordinary acquisition timeout already does. No other similar shrinking-remaining-time-into-a-validating-call pattern exists elsewhere in the codebase (checked directly — `_poll_scope_armed` and every other polling loop pass a *fixed* timeout on every iteration, not a shrinking one). Regression tests (`tests/test_sequencer.py`): reaching the deadline at the loop boundary with the fake clock landing exactly on zero and slightly negative remaining time; proving the HAL is never called with `timeout_s <= 0`; proving K3 still opens safely and exactly once in both cases.
+
 ---
 
 ## 6. Success path — capture, analyze, commit
@@ -293,9 +310,36 @@ Then `CycleState.DIAGNOSTICS_CAPTURING` → `scope.capture_timeout_diagnostics()
 
 **Both of these run only after `_open_mains_with_cooldown` has already fully executed** — the call sites in `_attempt_cycle` are unambiguous about this ordering. The reason is spelled out in a comment referencing `SCOPE_TRIGGER_DEBUG_LOG.md` Entry 3: a hung or wedged diagnostics query must never be able to delay de-energizing the EVSE mains. Tests: `test_diagnostics_capture_happens_only_after_full_safe_off`, `test_diagnostics_capture_never_recloses_k3_or_rearms`, `test_diagnostics_capture_failure_does_not_block_safe_off`, `test_diagnostics_write_failure_does_not_block_safe_off_or_change_halt_reason`.
 
+### 8.3 `_capture_controller_exception_diagnostics` (the defensive catch-all path)
+
+Called from `_run_cycle`'s last-resort `except Exception as exc:` handler — the one that produces `controller:unexpected:{ExcType}` halts — **before** `_halt_without_capture` collapses the exception down to just its class name. Added after a real incident (`5800_v3_real_20260813T175531Z`, cycle 38: `controller:unexpected:ValueError`) where the Pi became unreachable and non-persistent journald lost the original traceback with it, leaving a theory instead of a confirmed root cause.
+
+Persists, via `RunRecorder.write_controller_exception_diagnostics` (persistence doc), a JSON file under `diagnostics/<cycle_index>/controller_exception.json` containing: exception type and message, the full formatted traceback (`traceback.format_exception`), the last known `CycleState` (`context.transitions[-1].state.value`), the complete transition list for that cycle, and both the capture and cycle-start monotonic timestamps. Same rules as the other diagnostics methods in this section: writes only under `diagnostics/`, never touches `runstate.json`/`cycles.csv`, and is wrapped in its own `try/except` — a *second* failure while trying to persist evidence about the *first* failure must not mask the original exception or prevent `_halt_without_capture` from running.
+
+Unlike §8.1/8.2, this one is **not** gated on running after safe-off — it's a local filesystem write (bounded, no live hardware I/O), and the normal per-cycle commit path already writes local artifacts before mains open on the success path (persistence doc §1), so this isn't a new risk pattern.
+
 ---
 
-## 9. `FaultCategory` — the other halt taxonomy
+## 9. Equipment refresh — `_maybe_refresh_equipment` / `_refresh_equipment`
+
+Added after a second real incident: the camera reported `CAMERA_UNAVAILABLE` immediately, before the vision gate even reached the boot-wait phase, for three consecutive cycles mid-campaign (482–484) — root-caused to the C270 re-enumerating from `/dev/video0` to `/dev/video1` after a USB reconnect event, consistent with a wedged reader thread that only a fresh `stop()`/`start()` (not just waiting) actually clears.
+
+Checked at the very top of `run()`'s per-cycle `while` loop, **before `_run_cycle` is even called** — guaranteed to run before mains are ever commanded closed for that `cycle_index`, never mid-cycle, never energized. Two independent triggers, either of which fires a refresh:
+
+- **Scheduled**: every `timing.equipment_refresh_interval_cycles`-th cycle (default 50; `0` disables it).
+- **Reactive**: after `timing.equipment_refresh_after_consecutive_camera_unavailable` consecutive cycles carrying `classify.DEGRADED_FLAG_CAMERA_UNAVAILABLE` in their `degraded_flags` (default 3, matching the real incident; `0` disables it). The streak is tracked in `run()`'s loop, incremented/reset right after each `_run_cycle` call based on `execution.degraded_flags`, and passed into `_maybe_refresh_equipment` on the next iteration.
+
+Either trigger firing resets the streak to 0 — the reactive trigger always needs a *fresh* run of consecutive failures after any refresh before firing again, rather than refreshing every single cycle against a camera that's genuinely broken in a way a software refresh can't fix.
+
+`_refresh_equipment` itself is best-effort and **never raises into the caller**: `self._camera.stop(); self._camera.start()` and `self._scope.disconnect(); self._scope.connect()` are each wrapped in their own `try/except`, logging via `self._logger.exception(...)` on failure rather than propagating. If the refresh itself fails, the cycle proceeds normally on the existing connection — any real underlying problem still surfaces through the cycle's own proper halt path (and, since the CLI/lifecycle doc §8, gets auto-retried up to the normal streak limits) rather than being masked by a confusing failure inside a maintenance operation.
+
+**Deliberately does not attempt to distinguish "worth refreshing" from a scope already marked permanently unusable** after an unrecoverable diagnostics timeout (`ScopeReal._connection_unusable`, HAL doc — set once and never cleared, per `SCOPE_TRIGGER_DEBUG_LOG.md` Entry 6's segfault-risk reasoning). `connect()` simply raises again in that case, exactly as it would on the next real scope operation regardless — refresh isn't trying to be smarter than that flag, just to catch the milder degradation case it wasn't designed for.
+
+`Sequencer` calls `self._camera.stop()`/`start()` directly here — this is new; previously `Sequencer` never touched camera lifecycle at all, only `_execute_campaign` did (once, bracketing the whole campaign). The scope's `connect()`/`disconnect()` were already `Sequencer`-owned (§4), just previously only ever called once each, at the very top/bottom of `run()`.
+
+---
+
+## 10. `FaultCategory` — the other halt taxonomy
 
 Five values, always paired with a `Terminal` and a free-text `reason` string as `f"{category.value}:{reason}"` in `halt_reason`:
 
@@ -309,25 +353,27 @@ Five values, always paired with a `Terminal` and a free-text `reason` string as 
 
 ---
 
-## 10. Internal control-flow exceptions
+## 11. Internal control-flow exceptions
 
 `_SequencerHalt` and `_RetryCycle` are both frozen dataclasses that subclass `Exception` — used purely as typed signals to unwind the call stack straight to `_run_cycle`'s single handler, rather than threading a halt/retry decision back up through every intermediate return value. The module docstring calls this out as the explicit alternative to "an ad hoc chain of nested conditionals." `_SequencerHalt` carries `terminal`/`category`/`reason` directly; `_RetryCycle` carries just `reason` (its terminal/category are implicit — it either succeeds on retry or becomes `_retry_exhausted` under `RIG`/`HALTED`).
 
 ---
 
-## 11. Config values this module reads
+## 12. Config values this module reads
 
 All under `AppConfig`, resolved once at construction or read fresh per-cycle from `self._config`:
 
 | Field | Used for |
 |---|---|
 | `timing.cooldown_s` (10s) | Post-success dwell before the next cycle |
-| `timing.cooldown_retry_s` (60s) | Dwell after a `_RetryCycle` before re-attempting |
+| `timing.cooldown_retry_s` (60s) | Dwell after a `_RetryCycle` before re-attempting, and (CLI/lifecycle doc §8) between auto-retried halts |
 | `timing.boot_timeout_s` (90s) | Charging-gate wait timeout |
 | `timing.scope_arm_timeout_s` (2.0s) | Each `_poll_scope_armed` call's budget |
 | `timing.scope_acquisition_timeout_s` (5s) | `_poll_acquisition_with_backstop`'s outer bound |
 | `timing.k3_backstop_s` (0.300s) | The hard K3 backstop deadline |
 | `timing.mains_stagger_ms` (0) | Grace window before a K1/K2 mismatch halts |
+| `timing.equipment_refresh_interval_cycles` (50) | Scheduled camera/scope refresh interval (§9); `0` disables |
+| `timing.equipment_refresh_after_consecutive_camera_unavailable` (3) | Reactive camera/scope refresh trigger (§9); `0` disables |
 | `paths.min_free_disk_gb` (2) | Pre-cycle disk-space gate |
 | `vision.roi_*`, `vision.charging_green_*` | Built once into `_vision_roi`/`_vision_optical_config` |
 | `analysis.*` | Passed through unchanged to `analyze_waveform` |
@@ -336,7 +382,7 @@ All under `AppConfig`, resolved once at construction or read fresh per-cycle fro
 
 ---
 
-## 12. Test coverage map
+## 13. Test coverage map
 
 | Behavior | Test(s) |
 |---|---|
@@ -362,12 +408,16 @@ All under `AppConfig`, resolved once at construction or read fresh per-cycle fro
 | Fast green-flash gate grant | `test_green_flashing_grants_charging_quickly` |
 | Every fault-matrix row, end to end | `tests/test_faultmatrix.py::FaultMatrixTests` (one test per row — disk, scope comms drop/reconnect, K1/K2 mismatch, Cronitor swallow-failure, camera degrade, all vision-timeout variants, etc.) |
 | `safe_off` itself | `tests/test_safety.py` |
+| Timeout-boundary `ValueError` never reaches the HAL; K3 still opens exactly once at the boundary | (see §5.7.3) — regression tests in `tests/test_sequencer.py` covering exact-zero and slightly-negative remaining time |
+| Periodic/reactive equipment refresh, refresh-failure isolation | (see §9) — `tests/test_main.py` (`test_equipment_refresh_*`), since the fixed-interval/reactive-trigger decision lives in `run()` but is most directly exercised end-to-end via `_execute_campaign`'s tests |
 
 ---
 
-## 13. Things to know if you're about to change this file
+## 14. Things to know if you're about to change this file
 
 - Any new halt path must decide, deliberately, whether it's a `_SequencerHalt` (immediate) or should be added to the five-way `except` list in `_run_cycle` — don't invent a sixth ad hoc branch.
 - Anything added to the acquisition poll loop (§5.7) must not add unbounded blocking calls — the backstop's safety property depends on the loop's own cadence staying near 10ms even under a slow/hanging scope call.
+- Any new timeout-driven value passed to a HAL call that validates `timeout_s > 0` (§5.7.3) must be computed fresh, immediately before the call — never carried forward from an earlier read in the same loop iteration, even if it looks like the same instant.
+- Equipment refresh (§9) must keep running strictly before `_run_cycle` is called for that `cycle_index` — never move it inside `_attempt_cycle` itself, since retry (`_RetryCycle`) can re-enter `_attempt_cycle` for the same `cycle_index` and would double-fire the refresh.
 - Diagnostic capture code (§8) must stay strictly downstream of `_open_mains_with_cooldown` — this is the single most safety-relevant ordering constraint in the file, and it's enforced by convention/tests, not by the type system, so it's easy to violate accidentally in a refactor.
 - If you touch `:TER?` handling anywhere, remember it's read-and-clear — a new read added anywhere will silently consume the flag an existing checkpoint depends on.

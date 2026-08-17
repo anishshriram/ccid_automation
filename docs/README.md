@@ -16,8 +16,8 @@ Deep, code-accurate documentation of how the system works: every module's role, 
 | 8 | [Test Suite Guide](test-suite-guide.md) | all of `tests/` |
 | — | [System Overview](system-overview.md) | how everything connects |
 
-All 9 documents complete as of 2026-08-12.
+All 9 documents complete as of 2026-08-12; refreshed 2026-08-17 to cover the auto-retry campaign loop, periodic/reactive equipment refresh, the acquisition-poll timeout-boundary fix, durable controller-exception diagnostics, and the stable udev-based camera device path.
 
 **Also here:**
 - [Legacy Documentation Audit](legacy-documentation-audit.md) — a discrepancy report checking the seven legacy root-level docs (`CODING_AGENT_HANDOFF.md`, `coding_instructions.txt`, `DEPLOYMENT.txt`, `handoff_latest.md`, `IMPLEMENTATION_QUESTIONS.md`, `IMPLEMENTATION_STATUS.md`, `PI_SETUP_AND_TEST_PLAN.md`) against current reality before they're deleted — what was stale/wrong, what's still open, and what content has no replacement yet.
-- [Build and Commissioning Story](build-and-commissioning-issue-log.md) — a narrative account (not a catalog) of the project's real struggles, consolidated from the three raw issue logs (71/87/154 entries) plus the full technical depth of `SCOPE_TRIGGER_DEBUG_LOG.md`: the oscilloscope's four-week no-trigger mystery, the vision/charging-gate redesigns, the V1→V2→V3 analysis story, and what's still open going into the 6,000-cycle campaign.
+- [Build and Commissioning Story](build-and-commissioning-issue-log.md) — a narrative account (not a catalog) of the project's real struggles, consolidated from the three raw issue logs (71/87/154 entries) plus the full technical depth of `SCOPE_TRIGGER_DEBUG_LOG.md`: the oscilloscope's four-week no-trigger mystery, the vision/charging-gate redesigns, the V1→V2→V3 analysis story, the cycle-38 `ValueError` and the auto-retry/equipment-refresh work that followed it, and what's still open going into the 6,000-cycle campaign.

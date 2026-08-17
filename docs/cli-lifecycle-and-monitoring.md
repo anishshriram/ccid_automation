@@ -1,6 +1,6 @@
 # CLI, Lifecycle & Monitoring
 
-**Source file:** `ccid/main.py` (561 lines)
+**Source file:** `ccid/main.py` (681 lines)
 **Tests:** `tests/test_main.py`
 
 This is the process entry point — everything that turns `python -m ccid.main ...` into a running campaign: argument parsing, signal-safe shutdown, systemd watchdog integration, outbound monitoring (ntfy + Cronitor), and the glue that constructs a `Sequencer` wired to either real or simulated hardware.
@@ -71,7 +71,7 @@ Every one of the six methods checks `if not self._cronitor_url` / `if not self._
 Reads `config.modes.{gpio,scope,camera}_mode` **independently** — you can run, say, a real scope against simulated contactors and camera (useful for scope-only bench testing), though `ccid.main simulate`'s own guard (§6) requires all three to be `sim` together. For each of the three:
 - **`gpio_mode`**: `sim` → `GpioSimContactorController`; else → `GpioRealContactorController(gpio_k1/k2/k3=config.gpio.*, output_factory=...)` (the factory injection point tests use to avoid touching real GPIO).
 - **`scope_mode`**: `sim` → `ScopeSim(scenario=scope_sim_scenario or a 200kHz/50k-sample default, ...)`; else → `ScopeReal(resource=scope_resource, ...)`, which **raises `ValueError`** if `scope_resource` (from `CCID_SCOPE_RESOURCE`) is missing — a real-scope run cannot silently fall back to anything.
-- **`camera_mode`**: `sim` → `CameraSim(**camera_sim_kwargs)`; else → `CameraReal(config=CameraRealConfig(device_index=config.camera.device_index), capture_factory=..., state_classifier=camera_classifier)`. This is the exact point where `ccid.classify`'s HSV logic gets wired into the real camera HAL implementation (HAL doc §4) — `camera_classifier` is threaded in from the caller, keeping `camera_real.py` itself free of any vision domain knowledge.
+- **`camera_mode`**: `sim` → `CameraSim(**camera_sim_kwargs)`; else → `CameraReal(config=CameraRealConfig(device_index=config.camera.device_index), capture_factory=..., state_classifier=camera_classifier)`. This is the exact point where `ccid.classify`'s HSV logic gets wired into the real camera HAL implementation (HAL doc §4) — `camera_classifier` is threaded in from the caller, keeping `camera_real.py` itself free of any vision domain knowledge. `config.camera.device_index` is `int | str` — either a raw `/dev/videoN` index or a stable udev-provided device path (`deploy/99-c270-camera.rules` creates `/dev/ccid_camera`); `cv2.VideoCapture()` accepts both transparently, so no branching is needed here. The string form exists specifically because a raw index isn't stable across USB reconnects (HAL doc §3).
 
 ---
 
@@ -99,7 +99,8 @@ bundle = build_hal_bundle(config, scope_resource, monotonic_now=time.monotonic, 
 sequencer = Sequencer(..., sleep=lambda seconds: watchdog.sleep(seconds, stop_check=lifecycle.check))
 try:
     bundle.camera.start()
-    result = sequencer.run(run_dir, state)
+    result = _run_campaign_with_auto_retry(sequencer, run_dir, state, notifier, watchdog, lifecycle,
+                                            cooldown_retry_s=config.timing.cooldown_retry_s)
 except StopRequested as exc:
     safe_off(bundle.contactors); notify_fault(...); return 130
 finally:
@@ -113,9 +114,50 @@ Two details worth being precise about:
 - **The injected `sleep` is the watchdog-aware one, not a bare `time.sleep`.** This is the actual wiring that makes §3's claim true — every sleep inside `Sequencer` (cooldown, retry-cooldown, the vision-gate poll interval, the Entry 14 diagnostic delay) goes through `SystemdNotifier.sleep`, which both pings the watchdog during long waits and checks for a pending stop signal.
 - **`safe_off` is called here, in `_execute_campaign`'s `finally`, in addition to the one already inside `Sequencer.run`'s own `finally`** (sequencer doc §4.2). This looks redundant and is — deliberately. `Sequencer.run`'s `safe_off` handles the normal case; this outer one is a second, independent backstop in case `Sequencer.run` itself raised something unexpected before reaching its own `finally`, or in case `bundle.camera.stop()` (which runs first, in the same `finally` block here) somehow interfered. It's wrapped in its own bare `except Exception: pass` — this is the one place in the whole codebase where a `safe_off` failure is silently discarded rather than surfaced, because by this point in the shutdown sequence there is nothing further downstream that could act on it.
 
+**As of the auto-retry work below, `_execute_campaign` itself no longer calls `sequencer.run()` directly** — it calls `_run_campaign_with_auto_retry`, which may invoke `sequencer.run()` more than once before this function ever sees a result. Everything else about `_execute_campaign` (the `StopRequested` handling, the double `safe_off`, the camera start/stop bracketing the whole thing) is unchanged and still wraps the *entire* auto-retry loop, not just one attempt.
+
 ---
 
-## 8. `_finalize_result` — the exit code contract
+## 8. `_run_campaign_with_auto_retry` — a halt no longer ends the campaign by itself
+
+Added after real unattended campaigns kept stopping on the first halt of any kind — a scope timeout, a `ValueError`-class controller bug, disk space, a genuine DUT no-trip — and then just sitting idle until a human noticed and manually resumed. That idle-until-noticed gap is what was actually generating repeated Cronitor alerts on an overnight run, not the underlying faults themselves being unrecoverable.
+
+```python
+def _run_campaign_with_auto_retry(*, sequencer, run_dir, state, notifier, watchdog, lifecycle, cooldown_retry_s):
+    no_trip_streak = 0
+    other_streak = 0
+    current_state = state
+    while True:
+        result = sequencer.run(run_dir=run_dir, state=current_state)
+        made_progress = len(result.cycles) > 1
+        if result.terminal is Terminal.COMPLETE:
+            return result
+        if made_progress:
+            no_trip_streak = other_streak = 0
+        if result.terminal is Terminal.NO_TRIP:
+            no_trip_streak += 1; streak, limit = no_trip_streak, 3
+        else:
+            other_streak += 1; streak, limit = other_streak, 5
+        if streak >= limit:
+            return result   # give up for real - same exit path as before this feature existed
+        watchdog.sleep(cooldown_retry_s, stop_check=lifecycle.check)
+        attempted_cycle_index = result.cycles[-1].cycle_index if result.cycles else result.state.last_completed_cycle
+        current_state = replace(result.state,
+                                 last_completed_cycle=max(result.state.last_completed_cycle, attempted_cycle_index),
+                                 halt_reason=None)
+```
+
+**The two streak limits are asymmetric on purpose.** `NO_TRIP` (the DUT genuinely failed to clear a fault within the no-trip window) gets a limit of **3**; every other non-`COMPLETE` terminal (`RIG_FAULT`, and `HALTED` with any `fault_category` — `CONTROLLER`, `PERSISTENCE`, etc.) shares a limit of **5**. The reasoning, worked through with the rig operator directly: a marginal `FAIL` near the 24.97 ms pass limit really can be phase-random luck (handoff §4's own argument — up to about one extra half-cycle of delay), and that case already auto-continues on its own without ever reaching this loop at all, since `FAIL` doesn't halt `sequencer.run()`. `NO_TRIP` sits at a 100 ms threshold specifically because that's far beyond what phase randomness alone explains — a repeated `NO_TRIP` is the DUT actually failing the thing this rig exists to test for, not a rig hiccup, so it should reach a human faster than ordinary scope/software flakiness does.
+
+**`made_progress` is deliberately `len(result.cycles) > 1`, not a `pass_count + fail_count` diff.** `sequencer.run()` only ever returns on `Terminal.COMPLETE` or a halt — every `PASS`/`FAIL` cycle in between just continues the same call — so more than one entry in `result.cycles` means at least one cycle before this halt genuinely completed. An earlier version of this used `pass_count + fail_count` against a baseline, and that was a real bug: `RunRecorder.record_cycle` counts *any* non-`"PASS"` verdict as a fail, including a committed `NO_TRIP` — meaning a `NO_TRIP` would have looked like "progress" and silently reset its own streak, defeating the entire point of giving it a tighter limit. Found by writing the regression test, not by inspection.
+
+**Resuming after a halt is not simply clearing `halt_reason`.** Some halts commit a full cycle record (`last_completed_cycle` advances — a sanity-check-triggered `RIG_FAULT`, or a real `NO_TRIP` verdict, both of which have an analyzed waveform); others halt before there's anything to commit (`scope_never_triggered_or_acquire_timeout`, or a `CONTROLLER` exception mid-attempt) and leave `last_completed_cycle` unchanged. In that second case, K3 may already have legitimately closed once for that `cycle_index` before the halt occurred — the charging-gate token is enforced single-use per `cycle_index` (sequencer doc §5.3), so naively retrying the *same* `cycle_index` a second time raises `SafetyViolationError`. This was a real bug caught by a real regression test, not a hypothetical: fixed by always advancing past whichever `cycle_index` was actually attempted (`result.cycles[-1].cycle_index`, populated for every attempt whether or not it committed), never just trusting `last_completed_cycle`. One visible side effect: a `cycle_index` that halts before committing anything is skipped in `cycles.csv`'s numbering rather than reused — not a new gap (that attempt never got a CSV row before this feature existed either, it just used to end the campaign instead), but worth knowing when reading a campaign's row numbers.
+
+Intermediate retries only log (`LOGGER.warning`) — they do not call `notify_fault`/`heartbeat_fail`. You'll only hear from Cronitor once, when a streak is actually exhausted, exactly as before this feature existed. Regular per-cycle Cronitor heartbeats keep firing throughout auto-retry as long as cycles keep committing; if a `CONTROLLER`/`PERSISTENCE`-class failure repeats without ever committing a cycle, Cronitor's own missing-heartbeat grace window is a second, independent safety net on top of the 5-streak cap.
+
+---
+
+## 9. `_finalize_result` — the exit code contract
 
 ```
 COMPLETE           → notify_complete, return 0
@@ -125,11 +167,11 @@ anything else (HALTED: persistence/controller/peripheral)  → notify_fault + he
 ```
 (`StopRequested`, handled earlier in `_execute_campaign`, returns `130` — the conventional "terminated by signal" exit code, 128+SIGINT's number.)
 
-This is a real operational contract, not an incidental detail — it's what `deploy/ccid-automation.service`'s `Restart=on-failure` and any wrapping operator scripts key off of to distinguish "the campaign finished" from "a DUT genuinely failed" from "the rig itself has a problem" from "something else broke," without needing to parse log text. Both `notify_fault` (ntfy push) and `heartbeat_fail` (Cronitor explicit-failure ping) fire together on every non-COMPLETE, non-signal exit — the two monitoring channels are meant to be redundant with each other for anything that counts as a real halt.
+This is a real operational contract, not an incidental detail — it's what `deploy/ccid-automation.service`'s `Restart=on-failure` and any wrapping operator scripts key off of to distinguish "the campaign finished" from "a DUT genuinely failed" from "the rig itself has a problem" from "something else broke," without needing to parse log text. Both `notify_fault` (ntfy push) and `heartbeat_fail` (Cronitor explicit-failure ping) fire together on every non-COMPLETE, non-signal exit — the two monitoring channels are meant to be redundant with each other for anything that counts as a real halt. **This only ever sees the *final* result of `_run_campaign_with_auto_retry` (§8)** — a streak that gets auto-retried and later recovers never reaches this function at all; only an exhausted streak or a genuine `COMPLETE` does.
 
 ---
 
-## 9. Test coverage map
+## 10. Test coverage map
 
 | Behavior | Test(s) |
 |---|---|
@@ -141,12 +183,22 @@ This is a real operational contract, not an incidental detail — it's what `dep
 | `resume --allow-config-hash-override` bypasses hash validation | `test_cmd_resume_allows_config_hash_override` |
 | `status` is side-effect-free and reports current state | `test_cmd_status_is_safe_and_reports_runstate` |
 | Best-effort monitoring never raises even when the transport does (fault-matrix row) | `tests/test_faultmatrix.py::test_cronitor_request_failure_is_swallowed_row` |
+| Auto-retry recovers after transient `RIG_FAULT`s, without reusing a `cycle_index` that already closed K3 | `test_auto_retry_recovers_after_transient_rig_faults` |
+| Auto-retry gives up after exactly 5 consecutive `RIG_FAULT`/`CONTROLLER`-class halts | `test_auto_retry_gives_up_after_five_consecutive_rig_faults` |
+| Auto-retry gives up after exactly 3 consecutive `NO_TRIP`s (the tighter limit) | `test_auto_retry_gives_up_after_three_consecutive_no_trips` |
+| The streak resets on any cycle that actually completes, not just on a fixed count | `test_auto_retry_streak_resets_on_a_completed_cycle` |
+| A stop request arriving during a retry cooldown propagates rather than being swallowed | `test_stop_requested_during_retry_cooldown_propagates` |
+| Periodic equipment refresh fires at the configured interval, camera/scope call counts | `test_equipment_refresh_fires_at_every_configured_interval`, `test_equipment_refresh_disabled_by_default` |
+| Reactive equipment refresh fires after N consecutive camera-unavailable cycles, independent of the fixed schedule | `test_equipment_refresh_reactive_trigger_fires_on_consecutive_camera_unavailable`, `test_equipment_refresh_reactive_trigger_disabled_by_default` |
+| A refresh failure is logged and swallowed rather than crashing the cycle | `test_equipment_refresh_failure_does_not_crash_the_cycle` |
 
 ---
 
-## 10. Things to know if you're about to change this file
+## 11. Things to know if you're about to change this file
 
 - **Any new long-running wait inside `Sequencer` should go through the injected `sleep`, not a bare `time.sleep`** — bypassing it silently drops both the watchdog ping and the signal-check behavior for that specific wait.
 - If you add a fifth CLI command, decide deliberately whether it needs the full lifecycle wrapper (signal handling + watchdog) or belongs with `status` outside it — that choice should track whether the command can energize anything, not just convenience.
-- The exit-code contract (§8) is a real interface other things depend on (the systemd unit, any operator scripts) — don't repurpose an exit code without checking what currently keys off it.
+- The exit-code contract (§9) is a real interface other things depend on (the systemd unit, any operator scripts) — don't repurpose an exit code without checking what currently keys off it. It only ever reflects the *final* outcome of auto-retry (§8), not every individual halt along the way.
 - `_execute_campaign`'s double `safe_off` (§7) is intentional defense in depth, not a bug to "clean up" — removing the outer one would remove the only backstop against a failure mode inside `Sequencer.run` that somehow escapes its own `finally`.
+- **If you add a new halt category, decide deliberately which streak it belongs to** (§8) — the default for anything that isn't `NO_TRIP` is the 5-limit shared bucket, which is appropriate for "probably transient" failures but not for anything that represents the DUT itself failing.
+- Equipment refresh (`Sequencer._maybe_refresh_equipment`/`_refresh_equipment`, sequencer doc) lives in `Sequencer.run()`, not here — `_execute_campaign` only owns the camera's initial `start()`/final `stop()` bracketing the whole campaign; the periodic/reactive mid-campaign refreshes are the sequencer's own responsibility, since it's the one that knows the current `cycle_index` and the per-cycle degraded-flag history.

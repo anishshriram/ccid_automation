@@ -1,6 +1,6 @@
 # Test Suite Guide
 
-**25 files, 349 tests, 2 intentional skips, ~3.6s to run the whole thing.** Run with:
+**25 files, 364 tests, 2 intentional skips, ~7s to run the whole thing.** Run with:
 ```
 python3 -m unittest discover -s tests
 ```
@@ -27,7 +27,7 @@ Grouped by which subsystem doc has the full behavioral detail. Where a doc alrea
 ### Sequencer & state machine → [sequencer-and-state-machine.md](sequencer-and-state-machine.md)
 | File | Covers |
 |---|---|
-| `test_sequencer.py` | The full cycle state machine, TER checkpoints, forced-diagnostic capture, backstop timing, every halt/retry path — the single largest test file behaviorally (1077 lines) |
+| `test_sequencer.py` | The full cycle state machine, TER checkpoints, forced-diagnostic capture, backstop timing, every halt/retry path, the acquisition-poll timeout-boundary regression — the single largest test file behaviorally |
 | `test_faultmatrix.py` | Every row of `coding_instructions.txt`'s fault matrix, end to end through the real `Sequencer` — see §4 below |
 | `test_safety.py` | `safe_off` and the interlocks it depends on (K3-requires-K1&K2, K1/K2-blocked-while-K3-closed, single-use gate tokens, mismatch-stagger debouncing) |
 | `test_states.py` | `CycleState` enum completeness, `CycleDecision` immutability — thin, since `states.py` itself is almost pure enums |
@@ -58,12 +58,12 @@ Grouped by which subsystem doc has the full behavioral detail. Where a doc alrea
 |---|---|
 | `test_recorder.py` | The commit path, diagnostic writes, sticky halt-reason persistence |
 | `test_resume.py` | **Real crash-injection proofs** — not just unit assertions, actual simulated crashes at each commit checkpoint followed by a verified-correct resume |
-| `test_config.py` | Strict validation (every rejected-input case), hash stability, cross-field invariants |
+| `test_config.py` | Strict validation (every rejected-input case), hash stability, cross-field invariants, `camera.device_index` accepting either an int or a stable string device path |
 
 ### CLI/lifecycle/monitoring → [cli-lifecycle-and-monitoring.md](cli-lifecycle-and-monitoring.md)
 | File | Covers |
 |---|---|
-| `test_main.py` | HAL bundle construction, systemd watchdog sleep-splitting, Cronitor/ntfy notifier behavior, all three energizing commands' happy paths, the safe `status` command |
+| `test_main.py` | HAL bundle construction, systemd watchdog sleep-splitting, Cronitor/ntfy notifier behavior, all three energizing commands' happy paths, the safe `status` command, the auto-retry streak logic (`_run_campaign_with_auto_retry` — recovery, both streak limits, streak-reset-on-progress, the cycle_index-skip-on-retry safety fix), periodic and reactive equipment refresh |
 
 ### Tools → [tools.md](tools.md)
 | File | Covers |
