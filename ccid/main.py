@@ -12,7 +12,7 @@ independent of how the campaign ended.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import json
 import logging
@@ -38,6 +38,19 @@ DEFAULT_CONFIG_PATH = "config.yaml"
 DEFAULT_TARGET_CYCLES = 6000
 DEFAULT_SCOPE_RESOURCE_ENV = "CCID_SCOPE_RESOURCE"
 DEFAULT_NTFY_TOPIC_URL_ENV = "CCID_NTFY_TOPIC_URL"
+
+# Auto-retry policy for unattended campaigns: a halt no longer stops the
+# campaign outright. Instead _execute_campaign clears the halt and resumes
+# in-process, up to a streak limit that resets on any cycle that actually
+# completes (PASS or FAIL - both already continue on their own and never
+# reach this loop). NO_TRIP gets its own, much shorter limit: unlike a rig/
+# software hiccup, a NO_TRIP means the DUT genuinely failed to clear the
+# fault, which is the one thing this rig exists to catch, so a repeated
+# NO_TRIP should reach a human well before a repeated RIG_FAULT/CONTROLLER/
+# PERSISTENCE issue does. Every attempted cycle - retried or not - still
+# commits through the normal crash-safe path and lands in cycles.csv.
+_NO_TRIP_RETRY_LIMIT = 3
+_OTHER_HALT_RETRY_LIMIT = 5
 
 
 class StopRequested(RuntimeError):
@@ -465,6 +478,105 @@ def _cmd_simulate(args, config: AppConfig, recorder: RunRecorder, notifier: Http
     )
 
 
+def _run_campaign_with_auto_retry(
+    *,
+    sequencer: Sequencer,
+    run_dir: Path,
+    state: RunState,
+    notifier: HttpNotifier,
+    watchdog: SystemdNotifier,
+    lifecycle: LifecycleSignals,
+    cooldown_retry_s: float,
+) -> SequencerRunResult:
+    """Runs the campaign to completion, clearing and resuming in-process
+    through any halt up to the streak limits above. A halt is no longer
+    the end of the campaign by itself - only exhausting a streak, or the
+    operator explicitly stopping the process, ends it here.
+
+    `sequencer.run()` already only returns once it hits Terminal.COMPLETE
+    or a halt (never on an individual PASS/FAIL cycle - those continue
+    inside that call) - so every iteration of this loop corresponds to one
+    full halt-to-resume cycle.
+
+    Resuming is *not* simply clearing `halt_reason` and calling it again
+    with the state as returned. Some halts commit a full cycle record
+    (last_completed_cycle advances - e.g. a sanity-check-triggered
+    RIG_FAULT, or a NO_TRIP verdict, both of which have a real analyzed
+    waveform); others halt before there's anything to commit (e.g. "scope
+    never triggered," or a CONTROLLER exception mid-attempt) and leave
+    last_completed_cycle unchanged. In that second case K3 may already
+    have been legitimately closed once for that cycle_index before the
+    halt occurred - GpioSimContactorController (and the real HAL) enforce
+    a charging-gate token as single-use per cycle_index specifically to
+    catch a double-close, so naively retrying the *same* cycle_index would
+    immediately collide with that interlock and raise SafetyViolationError
+    (found by writing a real regression for this, not by inspection -
+    exactly the kind of thing this project's testing philosophy exists to
+    catch). So every retry advances past whichever cycle_index was just
+    attempted, whether or not it ended up committed - `result.cycles[-1]`
+    always reflects the attempted cycle_index either way, since `run()`
+    appends a CycleExecution for every attempt, committed or not. A
+    cycle_index skipped this way has no cycles.csv row (same as it would
+    without auto-retry at all - that's pre-existing, not new), but still
+    has diagnostics/<cycle_index>/ evidence from the timeout/exception
+    capture paths.
+    """
+
+    no_trip_streak = 0
+    other_streak = 0
+    current_state = state
+
+    while True:
+        result = sequencer.run(run_dir=run_dir, state=current_state)
+
+        # sequencer.run() only ever returns on Terminal.COMPLETE or a halt -
+        # every PASS/FAIL cycle in between just continues the same call, so
+        # more than one entry in result.cycles means at least one cycle
+        # before this halt genuinely completed (PASS or FAIL). Deliberately
+        # NOT `pass_count + fail_count` against a baseline: `fail_count`
+        # also increments for a committed NO_TRIP (recorder.py's
+        # record_cycle counts any non-"PASS" verdict as a fail), which
+        # would make a NO_TRIP look like "progress" and silently reset its
+        # own streak - the opposite of what NO_TRIP's tighter limit exists
+        # to do.
+        made_progress = len(result.cycles) > 1
+
+        if result.terminal is Terminal.COMPLETE:
+            return result
+
+        if made_progress:
+            no_trip_streak = 0
+            other_streak = 0
+
+        if result.terminal is Terminal.NO_TRIP:
+            no_trip_streak += 1
+            streak, limit, label = no_trip_streak, _NO_TRIP_RETRY_LIMIT, "no_trip"
+        else:
+            other_streak += 1
+            streak, limit, label = other_streak, _OTHER_HALT_RETRY_LIMIT, "rig_controller_persistence"
+
+        if streak >= limit:
+            LOGGER.warning(
+                "Auto-retry exhausted (%s streak %s/%s) at cycle %s, halt_reason=%s - stopping for real",
+                label, streak, limit, result.state.last_completed_cycle, result.halt_reason,
+            )
+            return result
+
+        LOGGER.warning(
+            "Auto-retrying after halt (%s streak %s/%s) at cycle %s, halt_reason=%s",
+            label, streak, limit, result.state.last_completed_cycle, result.halt_reason,
+        )
+        watchdog.sleep(cooldown_retry_s, stop_check=lifecycle.check)
+
+        attempted_cycle_index = result.cycles[-1].cycle_index if result.cycles else result.state.last_completed_cycle
+        next_last_completed_cycle = max(result.state.last_completed_cycle, attempted_cycle_index)
+        current_state = replace(
+            result.state,
+            last_completed_cycle=next_last_completed_cycle,
+            halt_reason=None,
+        )
+
+
 def _execute_campaign(
     *,
     config: AppConfig,
@@ -497,7 +609,15 @@ def _execute_campaign(
 
     try:
         bundle.camera.start()
-        result = sequencer.run(run_dir=run_dir, state=state)
+        result = _run_campaign_with_auto_retry(
+            sequencer=sequencer,
+            run_dir=run_dir,
+            state=state,
+            notifier=notifier,
+            watchdog=watchdog,
+            lifecycle=lifecycle,
+            cooldown_retry_s=config.timing.cooldown_retry_s,
+        )
     except StopRequested as exc:
         safe_off(bundle.contactors)
         notifier.notify_fault(state.run_id, state.last_completed_cycle, f"controller_stop:{exc}")

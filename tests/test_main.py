@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import io
 import json
 from pathlib import Path
@@ -9,17 +10,25 @@ import textwrap
 import unittest
 from unittest.mock import patch
 
+from ccid.classify import LedColor, frames_to_bgr_bytes, make_led_frame
 from ccid.config import load_config
+from ccid.hal.base import CameraFrame, CameraHealth, CameraStateSample
+from ccid.hal.gpio_sim import GpioSimContactorController
+from ccid.hal.scope_sim import ScopeSim, ScopeSimScenario
 from ccid.main import (
     HttpNotifier,
+    StopRequested,
     SystemdNotifier,
     _cmd_resume,
     _cmd_start,
     _cmd_status,
+    _run_campaign_with_auto_retry,
     build_hal_bundle,
     latest_run_dir,
 )
 from ccid.recorder import RunRecorder
+from ccid.sequencer import Sequencer
+from ccid.states import LedState, Terminal
 
 
 class _NoopLifecycle:
@@ -58,13 +67,98 @@ class _FakeNotifier:
         del run_id, last_completed_cycle, reason
 
 
+class _ManualClock:
+    def __init__(self, start_s: float = 0.0) -> None:
+        self.now_s = start_s
+
+    def now(self) -> float:
+        return self.now_s
+
+    def sleep(self, seconds: float) -> None:
+        self.now_s += max(0.0, seconds)
+
+
+class _AlwaysChargingCamera:
+    """Real, classifier-compatible green frames every call - the sequencer
+    runs the actual HSV classifier on whatever the camera hands it, so a
+    tiny dark placeholder frame (as opposed to a real green one) would
+    never actually grant the charging gate."""
+
+    def __init__(self) -> None:
+        self._latest_frame: CameraFrame | None = None
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def sample_state(self, now_monotonic_s: float) -> CameraStateSample:
+        rgb = make_led_frame(LedColor.GREEN, width=16, height=16)
+        bgr = frames_to_bgr_bytes(rgb)
+        frame = CameraFrame(
+            frame_bgr=bgr,
+            width=16,
+            height=16,
+            captured_at_utc=datetime.now(tz=timezone.utc),
+            captured_at_monotonic_s=now_monotonic_s,
+            metadata={"source": "test"},
+        )
+        self._latest_frame = frame
+        return CameraStateSample(
+            led_state=LedState.CHARGING,
+            observed_at_monotonic_s=now_monotonic_s,
+            health=CameraHealth.HEALTHY,
+            frame=frame,
+        )
+
+    def await_charging_gate(self, cycle_index: int, timeout_s: float, now_monotonic_s: float):
+        raise NotImplementedError("Sequencer uses classify.await_charging_gate")
+
+    def latest_frame(self) -> CameraFrame | None:
+        return self._latest_frame
+
+
+class _ScriptedScenarioScope(ScopeSim):
+    """Behaves like `scenarios[i]` on the i-th configure_for_cycle call
+    (0-indexed), holding at the final entry once the list is exhausted -
+    lets a single scope fake script an arbitrary sequence of per-cycle
+    outcomes (fail, fail, succeed, ...) across multiple sequencer.run()
+    invocations, which is what auto-retry actually drives."""
+
+    def __init__(self, *, clock: _ManualClock, scenarios: list[ScopeSimScenario]) -> None:
+        super().__init__(scenario=scenarios[0], monotonic_now=clock.now)
+        self._scenarios = scenarios
+        self.configure_calls = 0
+
+    def configure_for_cycle(self, settings) -> None:
+        index = min(self.configure_calls, len(self._scenarios) - 1)
+        self._scenario = self._scenarios[index]
+        self.configure_calls += 1
+        super().configure_for_cycle(settings)
+
+
+class _StopAfterNChecks:
+    """Lifecycle fake whose check() raises StopRequested starting on the
+    (n+1)-th call - simulates an operator stop request arriving during a
+    retry cooldown rather than before the first attempt."""
+
+    def __init__(self, n: int) -> None:
+        self._remaining = n
+
+    def check(self) -> None:
+        if self._remaining <= 0:
+            raise StopRequested("test_stop")
+        self._remaining -= 1
+
+
 class MainTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
-    def _write_config(self, config_hash_tag: str = "runs") -> Path:
+    def _write_config(self, config_hash_tag: str = "runs", *, boot_timeout_s: float = 0.5) -> Path:
         config_path = self.root / f"{config_hash_tag}-config.yaml"
         config_path.write_text(
             textwrap.dedent(
@@ -87,7 +181,7 @@ class MainTests(unittest.TestCase):
                 timing:
                   cooldown_s: 0.01
                   cooldown_retry_s: 0.02
-                  boot_timeout_s: 0.5
+                  boot_timeout_s: {boot_timeout_s}
                   scope_arm_timeout_s: 0.2
                   scope_acquisition_timeout_s: 0.2
                   k3_backstop_s: 0.3
@@ -282,6 +376,165 @@ class MainTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["run_state"]["run_id"], "20260803_192000")
+
+    def _make_run_and_sequencer(self, *, target_cycles: int, scope, clock: _ManualClock):
+        # boot_timeout_s must comfortably exceed the vision policy's
+        # charging_green_min_span_s (3.5s) or the charging gate itself
+        # times out before the scope is ever reached, regardless of what
+        # the scope fake does.
+        config = load_config(self._write_config(boot_timeout_s=6.0))
+        recorder = RunRecorder(config.paths.run_root)
+        run_dir = recorder.initialize_run(
+            run_id="20260817_120000",
+            target_cycles=target_cycles,
+            config_hash=config.canonical_hash(),
+            frozen_config_yaml="schema_version: 1\n",
+        )
+        state = recorder.load_run_state(
+            run_dir,
+            expected_config_hash=config.canonical_hash(),
+            allow_halted_resume=True,
+        )
+        sequencer = Sequencer(
+            config=config,
+            contactors=GpioSimContactorController(monotonic_now=clock.now),
+            scope=scope,
+            camera=_AlwaysChargingCamera(),
+            recorder=recorder,
+            monotonic_now=clock.now,
+            sleep=clock.sleep,
+        )
+        return run_dir, state, sequencer
+
+    @staticmethod
+    def _scope_scenario(**kwargs) -> ScopeSimScenario:
+        # Defaults give a 2 ms record (20_000 samples @ 10 MHz) - nowhere
+        # near long enough to span the 100 ms no-trip window, which fails
+        # SANITY_RECORD_SPANS_NO_TRIP_LIMIT and produces a RIG_FAULT
+        # instead of the intended verdict. A longer, slower record avoids
+        # that for every scenario used here, matching test_sequencer.py's
+        # own helper.
+        defaults = {"sample_rate_hz": 200_000.0, "sample_count": 50_000, "pretrigger_s": 0.020}
+        defaults.update(kwargs)
+        return ScopeSimScenario(**defaults)
+
+    def test_auto_retry_recovers_after_transient_rig_faults(self) -> None:
+        clock = _ManualClock()
+        scope = _ScriptedScenarioScope(
+            clock=clock,
+            scenarios=[
+                self._scope_scenario(never_triggered=True),
+                self._scope_scenario(never_triggered=True),
+                self._scope_scenario(trip_time_s=0.010),
+            ],
+        )
+        run_dir, state, sequencer = self._make_run_and_sequencer(target_cycles=3, scope=scope, clock=clock)
+
+        result = _run_campaign_with_auto_retry(
+            sequencer=sequencer,
+            run_dir=run_dir,
+            state=state,
+            notifier=_FakeNotifier(),
+            watchdog=_NoopWatchdog(),
+            lifecycle=_NoopLifecycle(),
+            cooldown_retry_s=0.01,
+        )
+
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        self.assertEqual(scope.configure_calls, 3)
+        self.assertEqual(result.state.last_completed_cycle, 3)
+
+    def test_auto_retry_gives_up_after_five_consecutive_rig_faults(self) -> None:
+        clock = _ManualClock()
+        scope = ScopeSim(scenario=self._scope_scenario(never_triggered=True), monotonic_now=clock.now)
+        run_dir, state, sequencer = self._make_run_and_sequencer(target_cycles=100, scope=scope, clock=clock)
+
+        result = _run_campaign_with_auto_retry(
+            sequencer=sequencer,
+            run_dir=run_dir,
+            state=state,
+            notifier=_FakeNotifier(),
+            watchdog=_NoopWatchdog(),
+            lifecycle=_NoopLifecycle(),
+            cooldown_retry_s=0.01,
+        )
+
+        self.assertEqual(result.terminal, Terminal.RIG_FAULT)
+        # "scope never triggered" halts before there's a waveform to
+        # analyze, so it never commits a cycle - last_completed_cycle
+        # legitimately stays at 4, one behind the cycle_index actually
+        # being attempted when the 5th consecutive halt gave up. The
+        # attempted cycle_index (tracked via result.cycles, appended for
+        # every attempt whether or not it committed) is the correct signal
+        # that exactly 5 attempts happened, one per streak count.
+        self.assertEqual(result.state.last_completed_cycle, 4)
+        self.assertEqual(result.cycles[-1].cycle_index, 5)
+
+    def test_auto_retry_gives_up_after_three_consecutive_no_trips(self) -> None:
+        clock = _ManualClock()
+        scope = ScopeSim(scenario=self._scope_scenario(no_trip=True), monotonic_now=clock.now)
+        run_dir, state, sequencer = self._make_run_and_sequencer(target_cycles=100, scope=scope, clock=clock)
+
+        result = _run_campaign_with_auto_retry(
+            sequencer=sequencer,
+            run_dir=run_dir,
+            state=state,
+            notifier=_FakeNotifier(),
+            watchdog=_NoopWatchdog(),
+            lifecycle=_NoopLifecycle(),
+            cooldown_retry_s=0.01,
+        )
+
+        self.assertEqual(result.terminal, Terminal.NO_TRIP)
+        # Unlike "never triggered," a NO_TRIP verdict has a real analyzed
+        # waveform and does commit through the normal path - last_completed_cycle
+        # genuinely advances by one per attempt here.
+        self.assertEqual(result.state.last_completed_cycle, 3)
+
+    def test_auto_retry_streak_resets_on_a_completed_cycle(self) -> None:
+        # 4 RIG_FAULTs, then a PASS (resets the streak), then 4 more
+        # RIG_FAULTs, then a PASS - never 5 consecutive failures, so this
+        # must reach COMPLETE rather than giving up. A broken (non-
+        # resetting) counter would give up partway through, since 4+4=8
+        # total failures is well past the limit of 5 if they were summed
+        # instead of tracked as a streak.
+        clock = _ManualClock()
+        fail = self._scope_scenario(never_triggered=True)
+        succeed = self._scope_scenario(trip_time_s=0.010)
+        scope = _ScriptedScenarioScope(
+            clock=clock,
+            scenarios=[fail, fail, fail, fail, succeed, fail, fail, fail, fail, succeed],
+        )
+        run_dir, state, sequencer = self._make_run_and_sequencer(target_cycles=10, scope=scope, clock=clock)
+
+        result = _run_campaign_with_auto_retry(
+            sequencer=sequencer,
+            run_dir=run_dir,
+            state=state,
+            notifier=_FakeNotifier(),
+            watchdog=_NoopWatchdog(),
+            lifecycle=_NoopLifecycle(),
+            cooldown_retry_s=0.01,
+        )
+
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        self.assertEqual(scope.configure_calls, 10)
+
+    def test_stop_requested_during_retry_cooldown_propagates(self) -> None:
+        clock = _ManualClock()
+        scope = ScopeSim(scenario=ScopeSimScenario(never_triggered=True), monotonic_now=clock.now)
+        run_dir, state, sequencer = self._make_run_and_sequencer(target_cycles=100, scope=scope, clock=clock)
+
+        with self.assertRaises(StopRequested):
+            _run_campaign_with_auto_retry(
+                sequencer=sequencer,
+                run_dir=run_dir,
+                state=state,
+                notifier=_FakeNotifier(),
+                watchdog=_NoopWatchdog(),
+                lifecycle=_StopAfterNChecks(1),
+                cooldown_retry_s=0.01,
+            )
 
 
 if __name__ == "__main__":
