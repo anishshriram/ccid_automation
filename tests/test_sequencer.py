@@ -436,6 +436,8 @@ class SequencerTests(unittest.TestCase):
             no_trip_limit_s=cfg.timing.no_trip_limit_s,
             heartbeat_grace_s=cfg.timing.heartbeat_grace_s,
             mains_stagger_ms=cfg.timing.mains_stagger_ms,
+            equipment_refresh_interval_cycles=0,
+            equipment_refresh_after_consecutive_camera_unavailable=0,
         )
         vision = VisionConfig(
             roi_x=0,

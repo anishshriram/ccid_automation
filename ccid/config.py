@@ -72,6 +72,8 @@ _TIMING_KEYS = frozenset(
         "no_trip_limit_s",
         "heartbeat_grace_s",
         "mains_stagger_ms",
+        "equipment_refresh_interval_cycles",
+        "equipment_refresh_after_consecutive_camera_unavailable",
     }
 )
 _MODES_KEYS = frozenset({"gpio_mode", "scope_mode", "camera_mode"})
@@ -121,6 +123,23 @@ class TimingConfig:
     no_trip_limit_s: float
     heartbeat_grace_s: float
     mains_stagger_ms: int
+    # Every Nth cycle, disconnect/reconnect the scope and stop/start the
+    # camera before that cycle's mains ever close - cheap insurance against
+    # gradual reader-thread/USB-session degradation over a multi-day
+    # campaign (real incident: camera reporting unavailable immediately,
+    # before boot, for several consecutive cycles mid-campaign). 0 disables
+    # it. Deliberately does not attempt to distinguish "worth refreshing"
+    # from a scope already marked permanently unusable after an
+    # unrecoverable diagnostics timeout - see Sequencer._refresh_equipment.
+    equipment_refresh_interval_cycles: int
+    # Reactive trigger, independent of the fixed schedule above: refresh
+    # immediately once this many cycles in a row degrade to
+    # classify.DEGRADED_FLAG_CAMERA_UNAVAILABLE, rather than waiting for
+    # the next scheduled interval - the fixed schedule alone would have
+    # missed a real 3-cycles-in-a-row incident that didn't land on a
+    # scheduled boundary. Resets to needing a fresh streak after either
+    # kind of refresh fires. 0 disables it.
+    equipment_refresh_after_consecutive_camera_unavailable: int
 
 
 @dataclass(frozen=True)
@@ -155,7 +174,15 @@ class VisionConfig:
 
 @dataclass(frozen=True)
 class CameraHardwareConfig:
-    device_index: int
+    # A raw numeric /dev/videoN index is not stable across USB
+    # reconnects - a real incident had the camera re-enumerate from
+    # video0 to video1/video2, leaving a hardcoded index pointing at
+    # nothing and producing immediate camera-unavailable degradation.
+    # Prefer a udev-provided stable device path (e.g. /dev/ccid_camera,
+    # see deploy/99-c270-camera.rules), which cv2.VideoCapture() accepts
+    # exactly like a numeric index. An int index is still accepted for
+    # environments without a udev rule installed.
+    device_index: int | str
 
 
 @dataclass(frozen=True)
@@ -245,7 +272,7 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
     )
 
     camera = CameraHardwareConfig(
-        device_index=_require_int(camera_map, "device_index", minimum=0),
+        device_index=_require_int_or_str(camera_map, "device_index", minimum=0),
     )
 
     timing = TimingConfig(
@@ -261,6 +288,12 @@ def _validate_and_build(raw: dict[str, Any]) -> AppConfig:
         no_trip_limit_s=_require_float(timing_map, "no_trip_limit_s", positive=True),
         heartbeat_grace_s=_require_float(timing_map, "heartbeat_grace_s", positive=True),
         mains_stagger_ms=_require_int(timing_map, "mains_stagger_ms", minimum=0),
+        equipment_refresh_interval_cycles=_require_int(
+            timing_map, "equipment_refresh_interval_cycles", minimum=0
+        ),
+        equipment_refresh_after_consecutive_camera_unavailable=_require_int(
+            timing_map, "equipment_refresh_after_consecutive_camera_unavailable", minimum=0
+        ),
     )
     if timing.pass_limit_s >= timing.no_trip_limit_s:
         raise ConfigValidationError("pass_limit_s must be lower than no_trip_limit_s")
@@ -446,6 +479,19 @@ def _require_str(raw: dict[str, Any], key: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ConfigValidationError(f"'{key}' must be a non-empty string")
+    return value
+
+
+def _require_int_or_str(raw: dict[str, Any], key: str, *, minimum: int | None = None) -> int | str:
+    value = raw.get(key)
+    if isinstance(value, str):
+        if not value.strip():
+            raise ConfigValidationError(f"'{key}' must be a non-negative integer or a non-empty string")
+        return value
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigValidationError(f"'{key}' must be a non-negative integer or a non-empty string")
+    if minimum is not None and value < minimum:
+        raise ConfigValidationError(f"'{key}' must be >= {minimum}")
     return value
 
 

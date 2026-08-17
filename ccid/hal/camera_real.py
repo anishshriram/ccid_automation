@@ -18,7 +18,9 @@ class CameraRealError(HardwareInterfaceError):
 
 @dataclass(frozen=True)
 class CameraRealConfig:
-    device_index: int = 0
+    # int index or a stable device path (e.g. a udev-provided symlink) -
+    # cv2.VideoCapture() accepts either transparently.
+    device_index: int | str = 0
     width: int = 640
     height: int = 480
     fps: int = 30
@@ -79,7 +81,7 @@ class CameraReal(CameraInterface):
             cap = self._capture_factory(self._cfg.device_index)
 
         if not cap or not cap.isOpened():
-            raise CameraRealError(f"Could not open camera index {self._cfg.device_index}")
+            raise CameraRealError(f"Could not open camera device {self._cfg.device_index!r}")
 
         self._capture = cap
         self._running = True

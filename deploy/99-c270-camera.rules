@@ -1,0 +1,29 @@
+# Stable device symlink for the CCID rig's Logitech C270 webcam.
+#
+# A raw /dev/videoN index is not stable across USB reconnects - the
+# camera has been observed re-enumerating from video0 to video1/video2,
+# leaving a hardcoded numeric index pointing at nothing and producing
+# immediate camera-unavailable degradation. This rule matches the
+# camera's own USB serial (stable regardless of enumeration order) and
+# creates a fixed symlink instead. ATTR{index}=="0" restricts the match
+# to the primary capture node - the C270 can expose more than one
+# video4linux device node per physical camera, and only one of them is
+# the actual capture stream (see docs/build-and-commissioning-issue-log.md
+# section D, "many /dev/video* devices made device selection ambiguous").
+#
+# Identified via: udevadm info -q property -n /dev/videoN
+#   ID_VENDOR=046d
+#   ID_SERIAL=046d_C270_HD_WEBCAM_26CF0190
+#   ID_MODEL=C270_HD_WEBCAM
+#
+# Install like the scope's udev rule (deploy/99-keysight-usbtmc.rules):
+#   sudo cp deploy/99-c270-camera.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+# Then unplug/replug the camera (or reboot) and confirm:
+#   ls -la /dev/ccid_camera
+# should point at whichever /dev/videoN the camera currently answers on.
+# config.yaml's camera.device_index should be set to /dev/ccid_camera,
+# not a raw index, once this is installed and verified.
+
+SUBSYSTEM=="video4linux", ENV{ID_SERIAL}=="046d_C270_HD_WEBCAM_26CF0190", ATTR{index}=="0", MODE="0666", GROUP="video", SYMLINK+="ccid_camera"

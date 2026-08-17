@@ -19,10 +19,20 @@ vision:
   charging_green_min_span_s: 3.5
 
 camera:
-  # Which /dev/videoN the Logitech C270 enumerates as on this Pi. Deployment-
-  # specific (depends on what else is plugged in), unlike VISA backend or
-  # GPIO pin numbers, so it lives in config rather than staying hardcoded.
-  device_index: 0
+  # A raw numeric /dev/videoN index is NOT stable across USB reconnects -
+  # the camera has re-enumerated from video0 to video1/video2 on this rig
+  # before, leaving a hardcoded index pointing at nothing and producing
+  # immediate camera-unavailable degradation. device_index accepts either
+  # an int index or a device path string (cv2.VideoCapture() takes both).
+  #
+  # DEPLOYMENT ORDER MATTERS: this value assumes deploy/99-c270-camera.rules
+  # is already installed on the Pi and /dev/ccid_camera exists (ls -la
+  # /dev/ccid_camera to confirm) - see that file's own header for the
+  # install steps. Deploying this config change before the udev rule is
+  # installed will fail to open the camera at all, which is worse than the
+  # numeric-index problem this is fixing. If the udev rule isn't installed
+  # yet, use a plain int (e.g. 0) instead until it is.
+  device_index: /dev/ccid_camera
 
 timing:
   cooldown_s: 10
@@ -35,6 +45,16 @@ timing:
   no_trip_limit_s: 0.100
   heartbeat_grace_s: 300
   mains_stagger_ms: 0
+  # Every 50th cycle, disconnect/reconnect the scope and stop/start the
+  # camera before mains close for that cycle - cheap periodic recovery for
+  # gradual USB/reader-thread degradation over a multi-day campaign. 0
+  # disables it.
+  equipment_refresh_interval_cycles: 50
+  # Reactive trigger, independent of the schedule above: refresh
+  # immediately after this many consecutive camera-unavailable cycles,
+  # rather than waiting for the next scheduled interval. Matches the real
+  # incident this was added for (3 consecutive cycles). 0 disables it.
+  equipment_refresh_after_consecutive_camera_unavailable: 3
 
 modes:
   gpio_mode: real

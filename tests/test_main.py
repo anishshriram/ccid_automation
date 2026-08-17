@@ -138,6 +138,75 @@ class _ScriptedScenarioScope(ScopeSim):
         super().configure_for_cycle(settings)
 
 
+class _CountingUnavailableCamera:
+    """Reports CAMERA_UNAVAILABLE on every sample - proves the reactive
+    refresh trigger fires from a consecutive-failure streak, independent
+    of the fixed schedule. Vision degrades to a fixed wait and continues
+    rather than halting, so a campaign against this fake still completes
+    normally; only the refresh call counts are the thing under test."""
+
+    def __init__(self) -> None:
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+    def sample_state(self, now_monotonic_s: float) -> CameraStateSample:
+        return CameraStateSample(
+            led_state=LedState.CAMERA_UNAVAILABLE,
+            observed_at_monotonic_s=now_monotonic_s,
+            health=CameraHealth.FAILED,
+            frame=None,
+        )
+
+    def await_charging_gate(self, cycle_index: int, timeout_s: float, now_monotonic_s: float):
+        raise NotImplementedError("Sequencer uses classify.await_charging_gate")
+
+    def latest_frame(self) -> CameraFrame | None:
+        return None
+
+
+class _CountingChargingCamera(_AlwaysChargingCamera):
+    """Same real green frames as _AlwaysChargingCamera, plus start()/stop()
+    call counts so a periodic-refresh feature can be proven against actual
+    lifecycle calls, not just inferred from timing."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+        super().start()
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        super().stop()
+
+
+class _CountingScope(ScopeSim):
+    """ScopeSim with connect()/disconnect() call counts, for the same
+    reason as _CountingChargingCamera."""
+
+    def __init__(self, *, clock: _ManualClock, scenario: ScopeSimScenario) -> None:
+        super().__init__(scenario=scenario, monotonic_now=clock.now)
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+
+    def connect(self) -> None:
+        self.connect_calls += 1
+        super().connect()
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
+        super().disconnect()
+
+
 class _StopAfterNChecks:
     """Lifecycle fake whose check() raises StopRequested starting on the
     (n+1)-th call - simulates an operator stop request arriving during a
@@ -158,7 +227,14 @@ class MainTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
-    def _write_config(self, config_hash_tag: str = "runs", *, boot_timeout_s: float = 0.5) -> Path:
+    def _write_config(
+        self,
+        config_hash_tag: str = "runs",
+        *,
+        boot_timeout_s: float = 0.5,
+        equipment_refresh_interval_cycles: int = 0,
+        equipment_refresh_after_consecutive_camera_unavailable: int = 0,
+    ) -> Path:
         config_path = self.root / f"{config_hash_tag}-config.yaml"
         config_path.write_text(
             textwrap.dedent(
@@ -189,6 +265,8 @@ class MainTests(unittest.TestCase):
                   no_trip_limit_s: 0.1
                   heartbeat_grace_s: 300
                   mains_stagger_ms: 0
+                  equipment_refresh_interval_cycles: {equipment_refresh_interval_cycles}
+                  equipment_refresh_after_consecutive_camera_unavailable: {equipment_refresh_after_consecutive_camera_unavailable}
                 modes:
                   gpio_mode: sim
                   scope_mode: sim
@@ -377,12 +455,29 @@ class MainTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["run_state"]["run_id"], "20260803_192000")
 
-    def _make_run_and_sequencer(self, *, target_cycles: int, scope, clock: _ManualClock):
+    def _make_run_and_sequencer(
+        self,
+        *,
+        target_cycles: int,
+        scope,
+        clock: _ManualClock,
+        camera=None,
+        equipment_refresh_interval_cycles: int = 0,
+        equipment_refresh_after_consecutive_camera_unavailable: int = 0,
+    ):
         # boot_timeout_s must comfortably exceed the vision policy's
         # charging_green_min_span_s (3.5s) or the charging gate itself
         # times out before the scope is ever reached, regardless of what
         # the scope fake does.
-        config = load_config(self._write_config(boot_timeout_s=6.0))
+        config = load_config(
+            self._write_config(
+                boot_timeout_s=6.0,
+                equipment_refresh_interval_cycles=equipment_refresh_interval_cycles,
+                equipment_refresh_after_consecutive_camera_unavailable=(
+                    equipment_refresh_after_consecutive_camera_unavailable
+                ),
+            )
+        )
         recorder = RunRecorder(config.paths.run_root)
         run_dir = recorder.initialize_run(
             run_id="20260817_120000",
@@ -399,7 +494,7 @@ class MainTests(unittest.TestCase):
             config=config,
             contactors=GpioSimContactorController(monotonic_now=clock.now),
             scope=scope,
-            camera=_AlwaysChargingCamera(),
+            camera=camera if camera is not None else _AlwaysChargingCamera(),
             recorder=recorder,
             monotonic_now=clock.now,
             sleep=clock.sleep,
@@ -535,6 +630,128 @@ class MainTests(unittest.TestCase):
                 lifecycle=_StopAfterNChecks(1),
                 cooldown_retry_s=0.01,
             )
+
+    def test_equipment_refresh_fires_at_every_configured_interval(self) -> None:
+        clock = _ManualClock()
+        camera = _CountingChargingCamera()
+        scope = _CountingScope(clock=clock, scenario=self._scope_scenario(trip_time_s=0.010))
+        run_dir, state, sequencer = self._make_run_and_sequencer(
+            target_cycles=10,
+            scope=scope,
+            clock=clock,
+            camera=camera,
+            equipment_refresh_interval_cycles=3,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        # Refreshes fire before cycles 3, 6, and 9 (10 % 3 != 0, so not
+        # before a would-be 11th cycle). Sequencer itself never calls
+        # camera start()/stop() outside of _refresh_equipment - that
+        # lifecycle is normally owned by main.py's _execute_campaign,
+        # which this test bypasses entirely - so these counts are exactly
+        # the refresh calls, nothing else.
+        self.assertEqual(camera.start_calls, 3)
+        self.assertEqual(camera.stop_calls, 3)
+        # connect() is called once at the top of run() (bracketing the
+        # whole campaign) plus once per refresh; disconnect() is called
+        # once per refresh plus once in run()'s own finally block.
+        self.assertEqual(scope.connect_calls, 1 + 3)
+        self.assertEqual(scope.disconnect_calls, 3 + 1)
+
+    def test_equipment_refresh_disabled_by_default(self) -> None:
+        clock = _ManualClock()
+        camera = _CountingChargingCamera()
+        scope = _CountingScope(clock=clock, scenario=self._scope_scenario(trip_time_s=0.010))
+        run_dir, state, sequencer = self._make_run_and_sequencer(
+            target_cycles=10,
+            scope=scope,
+            clock=clock,
+            camera=camera,
+            equipment_refresh_interval_cycles=0,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        self.assertEqual(camera.start_calls, 0)
+        self.assertEqual(camera.stop_calls, 0)
+        self.assertEqual(scope.connect_calls, 1)
+        self.assertEqual(scope.disconnect_calls, 1)
+
+    def test_equipment_refresh_failure_does_not_crash_the_cycle(self) -> None:
+        class _FailsToRestartCamera(_AlwaysChargingCamera):
+            def start(self) -> None:
+                raise RuntimeError("simulated camera restart failure")
+
+        clock = _ManualClock()
+        camera = _FailsToRestartCamera()
+        scope = ScopeSim(scenario=self._scope_scenario(trip_time_s=0.010), monotonic_now=clock.now)
+        run_dir, state, sequencer = self._make_run_and_sequencer(
+            target_cycles=5,
+            scope=scope,
+            clock=clock,
+            camera=camera,
+            equipment_refresh_interval_cycles=3,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        # The refresh attempt at cycle 3 raises inside camera.start(), but
+        # _refresh_equipment swallows it (logs and continues) rather than
+        # letting it propagate as a confusing mid-maintenance failure -
+        # the campaign completes normally on the camera connection that
+        # was never actually broken to begin with.
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+
+    def test_equipment_refresh_reactive_trigger_fires_on_consecutive_camera_unavailable(self) -> None:
+        clock = _ManualClock()
+        camera = _CountingUnavailableCamera()
+        scope = _CountingScope(clock=clock, scenario=self._scope_scenario(trip_time_s=0.010))
+        run_dir, state, sequencer = self._make_run_and_sequencer(
+            target_cycles=7,
+            scope=scope,
+            clock=clock,
+            camera=camera,
+            # Fixed schedule effectively disabled (never reached within 7
+            # cycles) - only the reactive trigger can be responsible for
+            # any refresh observed here.
+            equipment_refresh_interval_cycles=1000,
+            equipment_refresh_after_consecutive_camera_unavailable=3,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        # Camera never recovers, so the streak reaches 3 twice over 7
+        # cycles (before cycle 4, and again before cycle 7, since each
+        # trigger resets the streak to 0) - proving both that the reactive
+        # trigger fires without ever hitting the fixed schedule, and that
+        # it can fire more than once per campaign.
+        self.assertEqual(camera.start_calls, 2)
+        self.assertEqual(camera.stop_calls, 2)
+        self.assertEqual(scope.connect_calls, 1 + 2)
+        self.assertEqual(scope.disconnect_calls, 2 + 1)
+
+    def test_equipment_refresh_reactive_trigger_disabled_by_default(self) -> None:
+        clock = _ManualClock()
+        camera = _CountingUnavailableCamera()
+        scope = _CountingScope(clock=clock, scenario=self._scope_scenario(trip_time_s=0.010))
+        run_dir, state, sequencer = self._make_run_and_sequencer(
+            target_cycles=7,
+            scope=scope,
+            clock=clock,
+            camera=camera,
+            equipment_refresh_interval_cycles=0,
+            equipment_refresh_after_consecutive_camera_unavailable=0,
+        )
+
+        result = sequencer.run(run_dir=run_dir, state=state)
+
+        self.assertEqual(result.terminal, Terminal.COMPLETE)
+        self.assertEqual(camera.start_calls, 0)
+        self.assertEqual(camera.stop_calls, 0)
 
 
 if __name__ == "__main__":

@@ -206,11 +206,15 @@ class Sequencer:
         cycles: list[CycleExecution] = []
         current_state = state
         latch_slow_clear_count = 0
+        camera_unavailable_streak = 0
 
         self._scope.connect()
         try:
             cycle_index = current_state.last_completed_cycle + 1
             while cycle_index <= current_state.target_cycles:
+                camera_unavailable_streak = self._maybe_refresh_equipment(
+                    cycle_index, camera_unavailable_streak=camera_unavailable_streak
+                )
                 execution, next_state, cycle_transitions = self._run_cycle(
                     run_dir=run_dir,
                     state=current_state,
@@ -221,6 +225,10 @@ class Sequencer:
                 current_state = next_state
                 if execution.latch_slow_clear:
                     latch_slow_clear_count += 1
+                if DEGRADED_FLAG_CAMERA_UNAVAILABLE in execution.degraded_flags:
+                    camera_unavailable_streak += 1
+                else:
+                    camera_unavailable_streak = 0
                 if execution.terminal in (Terminal.NO_TRIP, Terminal.RIG_FAULT, Terminal.HALTED):
                     return SequencerRunResult(
                         terminal=execution.terminal,
@@ -253,6 +261,79 @@ class Sequencer:
             fault_category=None,
             latch_slow_clear_count=latch_slow_clear_count,
         )
+
+    def _maybe_refresh_equipment(self, cycle_index: int, *, camera_unavailable_streak: int) -> int:
+        """Decides whether to refresh before this cycle, and returns the
+        (possibly-reset) camera_unavailable_streak the caller should carry
+        forward. Two independent triggers, either of which fires a refresh:
+
+        - Scheduled: every `equipment_refresh_interval_cycles`-th cycle.
+        - Reactive: `equipment_refresh_after_consecutive_camera_unavailable`
+          consecutive camera-unavailable cycles in a row - added after a
+          real incident (3 consecutive cycles) that a fixed schedule alone
+          would only catch if it happened to land on a scheduled boundary.
+
+        Either trigger firing resets the streak to 0, so the reactive
+        trigger always requires a fresh run of consecutive failures after
+        any refresh (scheduled or reactive) before firing again, rather
+        than refreshing every single cycle against a camera that's
+        genuinely broken in a way refresh can't fix.
+        """
+        interval = self._config.timing.equipment_refresh_interval_cycles
+        threshold = self._config.timing.equipment_refresh_after_consecutive_camera_unavailable
+        scheduled = interval > 0 and cycle_index % interval == 0
+        reactive = threshold > 0 and camera_unavailable_streak >= threshold
+        if not (scheduled or reactive):
+            return camera_unavailable_streak
+        reasons = []
+        if scheduled:
+            reasons.append("scheduled")
+        if reactive:
+            reasons.append(f"reactive_after_{camera_unavailable_streak}_consecutive_camera_unavailable")
+        self._refresh_equipment(cycle_index, reason=",".join(reasons))
+        return 0
+
+    def _refresh_equipment(self, cycle_index: int, *, reason: str) -> None:
+        """Best-effort periodic recovery for gradual hardware/driver
+        degradation over a multi-day campaign - real incident: camera
+        reporting unavailable immediately, before boot, for several
+        consecutive cycles mid-campaign, consistent with a wedged reader
+        thread that only a fresh stop()/start() (not just waiting) clears.
+
+        Always runs at the top of the per-cycle loop in `run()`, before
+        mains are ever commanded closed for this cycle_index - never
+        mid-cycle, never while anything is energized. Deliberately never
+        raises into the caller: if the refresh itself fails, the cycle
+        proceeds normally and any real underlying problem surfaces through
+        its own proper halt/retry path instead of being masked by a
+        failure inside a maintenance operation. Does not attempt to
+        distinguish "worth refreshing" from a scope already marked
+        permanently unusable after an unrecoverable diagnostics timeout
+        (ScopeReal._connection_unusable, SCOPE_TRIGGER_DEBUG_LOG.md Entry
+        6) - connect() will simply raise again in that case, exactly as it
+        would on the next real scope operation regardless.
+        """
+        self._logger.info(
+            "Refreshing camera and scope before cycle %s (%s)",
+            cycle_index,
+            reason,
+        )
+        try:
+            self._camera.stop()
+            self._camera.start()
+        except Exception:
+            self._logger.exception(
+                "Camera refresh failed before cycle %s - continuing with the existing connection",
+                cycle_index,
+            )
+        try:
+            self._scope.disconnect()
+            self._scope.connect()
+        except Exception:
+            self._logger.exception(
+                "Scope refresh failed before cycle %s - continuing with the existing connection",
+                cycle_index,
+            )
 
     def _run_cycle(self, *, run_dir, state: RunState, cycle_index: int) -> tuple[CycleExecution, RunState, list[StateTransition]]:
         context = _CycleContext(cycle_index=cycle_index, monotonic_start=self._now())

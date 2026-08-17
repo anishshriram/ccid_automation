@@ -33,7 +33,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.vision.charging_green_window_s, 6.0)
         self.assertEqual(config.vision.charging_green_required_frames, 3)
         self.assertEqual(config.vision.charging_green_min_span_s, 3.5)
-        self.assertEqual(config.camera.device_index, 0)
+        self.assertEqual(config.camera.device_index, "/dev/ccid_camera")
+        self.assertEqual(config.timing.equipment_refresh_interval_cycles, 50)
+        self.assertEqual(
+            config.timing.equipment_refresh_after_consecutive_camera_unavailable, 3
+        )
         self.assertEqual(config.paths.min_free_disk_gb, 2)
         self.assertEqual(config.monitoring.cronitor_url_env, "CCID_CRONITOR_URL")
 
@@ -55,6 +59,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -85,9 +91,67 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
             monitoring: {cronitor_url_env: "  "}
+            """
+        )
+        with self.assertRaises(ConfigValidationError):
+            load_config(path)
+
+    def test_accepts_a_stable_device_path_string_for_camera_device_index(self) -> None:
+        path = self._write_config(
+            """
+            schema_version: 1
+            gpio: {k1: 17, k2: 27, k3: 22}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 6.0, charging_green_required_frames: 3, charging_green_min_span_s: 3.5}
+            camera: {device_index: /dev/ccid_camera}
+            timing:
+              cooldown_s: 10
+              cooldown_retry_s: 60
+              boot_timeout_s: 90
+              scope_arm_timeout_s: 2.0
+              scope_acquisition_timeout_s: 5
+              k3_backstop_s: 0.3
+              pass_limit_s: 0.02497
+              no_trip_limit_s: 0.1
+              heartbeat_grace_s: 300
+              mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
+            modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
+            paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
+            monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
+            """
+        )
+        config = load_config(path)
+        self.assertEqual(config.camera.device_index, "/dev/ccid_camera")
+
+    def test_rejects_empty_string_camera_device_index(self) -> None:
+        path = self._write_config(
+            """
+            schema_version: 1
+            gpio: {k1: 17, k2: 27, k3: 22}
+            vision: {roi_x: 35, roi_y: 120, roi_width: 450, roi_height: 350, charging_green_window_s: 6.0, charging_green_required_frames: 3, charging_green_min_span_s: 3.5}
+            camera: {device_index: ""}
+            timing:
+              cooldown_s: 10
+              cooldown_retry_s: 60
+              boot_timeout_s: 90
+              scope_arm_timeout_s: 2.0
+              scope_acquisition_timeout_s: 5
+              k3_backstop_s: 0.3
+              pass_limit_s: 0.02497
+              no_trip_limit_s: 0.1
+              heartbeat_grace_s: 300
+              mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
+            modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
+            paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
+            monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
             """
         )
         with self.assertRaises(ConfigValidationError):
@@ -109,6 +173,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -133,6 +199,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -157,6 +225,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -183,6 +253,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -204,6 +276,8 @@ class ConfigTests(unittest.TestCase):
             vision: {charging_green_required_frames: 3, charging_green_min_span_s: 3.5, charging_green_window_s: 6.0, roi_height: 350, roi_width: 450, roi_y: 120, roi_x: 35}
             timing:
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
               heartbeat_grace_s: 300
               no_trip_limit_s: 0.1
               pass_limit_s: 0.02497
@@ -242,6 +316,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -268,6 +344,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -294,6 +372,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -320,6 +400,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 2}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -346,6 +428,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs, min_free_disk_gb: 0}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -370,6 +454,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: sim, scope_mode: visa, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
@@ -394,6 +480,8 @@ class ConfigTests(unittest.TestCase):
               no_trip_limit_s: 0.1
               heartbeat_grace_s: 300
               mains_stagger_ms: 0
+              equipment_refresh_interval_cycles: 50
+              equipment_refresh_after_consecutive_camera_unavailable: 3
             modes: {gpio_mode: visa, scope_mode: sim, camera_mode: sim}
             paths: {run_root: ./runs, output_root: ./runs}
             monitoring: {cronitor_url_env: CCID_CRONITOR_URL}
