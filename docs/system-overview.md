@@ -75,7 +75,7 @@ A question worth answering precisely, since it's easy to assume "the sequencer" 
 Two things in this codebase are explicitly "versioned boundaries" — deliberately unfinished/improvable, with the mechanism for changing them built in from the start rather than requiring a later refactor:
 
 - **`AnalysisVersion`** (`ccid/analysis.py`) — the trip-time algorithm. Three real versions exist (V1, V2, V3); the rule is "supersede only by re-versioning, never by editing in place," and it's been exercised for real this session (a genuine onset-detection bug found and fixed as V3, with V1/V2 preserved exactly as originally shipped for replay fidelity). Full story: [trip-time-analysis-algorithm.md §6](trip-time-analysis-algorithm.md#6-the-v1--v2--v3-story-precisely).
-- **`config.yaml`'s `analysis.endpoint_definition`** — the project's own provisional definition of trip-time measurement endpoints, used because the governing standard (UL 2231-2 §23.3.1) hasn't been confirmed against the actual document yet. Frozen by the config hash so it can't drift silently mid-campaign. Still an open item — see `IMPLEMENTATION_QUESTIONS.md`.
+- **`config.yaml`'s `analysis.endpoint_definition`** — the project's own provisional definition of trip-time measurement endpoints, used because the governing standard (UL 2231-2 §23.3.1) hasn't been confirmed against the actual document yet. Frozen by the config hash so it can't drift silently mid-campaign. Still an open item — see `legacy-documentation-audit.md` §4.
 
 ---
 

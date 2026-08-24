@@ -1,14 +1,14 @@
 # Scope Trigger Debugging Log
 
-Running log of the oscilloscope no-trigger investigation. Every automated
-cycle currently halts with `rig:scope_never_triggered_or_acquire_timeout`.
-Append new entries as more hardware testing happens - keep entries in
-chronological order, and keep the "Current status" section at the top
-up to date rather than buried at the bottom.
+Running log of the oscilloscope no-trigger investigation. This is the raw, entry-by-entry SCPI-level record — for the narrative version of this same investigation (what was actually hard, what turned out to matter, and how it ended), read `build-and-commissioning-issue-log.md` §3 instead. That document explicitly does not duplicate this one; each serves a different purpose (story vs. record) and both are kept.
+
+Append new entries as more hardware testing happens — keep entries in chronological order, and keep the "Current status" section at the top up to date rather than buried at the bottom.
 
 ---
 
-## Current status (as of 2026-08-10)
+## Current status (as of 2026-08-10, resolution note added afterward — see below)
+
+> **Resolution, added after the fact — the investigation below never got to write this down itself.** Every entry in this log, including the "Current status" text immediately following this note, reads as open and "untested against real hardware." It wasn't left that way: a real 25-cycle campaign ran and was archived shortly after Entry 15's fix (commit `7a15241`), and three further real campaigns since (200-cycle, 483-cycle, and the 5,317-cycle campaign — see `campaign-results-index.md`) all completed using natural scope triggering with no recurrence of the no-trigger condition this entire log is about. Four separate, individually real hardware-adjacent bugs got found and fixed along the way (trigger mode — Entry 1; probe-ratio ordering — Entry 7; the `NREJect`-unsupported config-error handling — Entry 9; the USBTMC wedge/segfault diagnostics hardening — Entries 3-6) — none of them was the actual root cause. **The actual root cause was Entry 15's finding**: a state-tracking bug in the forced-diagnostic polling loop that discarded genuine successful natural triggers, which had nothing to do with the electrical signal chain at all. The lesson recorded at the time is worth keeping verbatim: *audit control-state flags before changing proven electrical settings.* See `build-and-commissioning-issue-log.md` §3 for the full narrative. The entries below are left exactly as originally written — they're an accurate record of what was known and believed at each point in time, not something to retroactively correct.
 
 **Entry 15: a real software bug was discarding successful, naturally-triggered
 acquisitions - fixed, and it may have contaminated some of this
