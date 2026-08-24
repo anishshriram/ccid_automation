@@ -3,6 +3,8 @@ __pycache__/
 *.pyo
 venv/
 runs/
+ccid_campaign_data/
+.DS_Store
 calib/booting/
 calib/booting_recommission/
 calib/green_exposure30/
