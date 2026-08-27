@@ -5,7 +5,7 @@
 
 This is the operational counterpart to the rest of the technical reference: how to take a freshly flashed Raspberry Pi all the way to a monitored real CCID campaign. Read §1 once per Pi, §2 once per significant code change (or before first real-hardware use), and §3 before every real-hardware campaign.
 
-> **Safety boundary, stated once, applies throughout:** software checks do not replace qualified electrical inspection, protective-earth verification, restricted access, correct probe grounding, flyback protection, or an accessible emergency disconnect.
+> **Safety boundary, stated once, applies throughout:** software checks do not replace qualified electrical inspection, protective-earth verification, restricted access, correct probe grounding, or an accessible emergency disconnect. **The as-built rig currently has no flyback diodes and no MOSFET gate pulldown resistors on any of the three contactor driver boards** (§1.6) — a real, unmitigated hardware gap, not something a preflight checklist can substitute for.
 
 ---
 
@@ -135,7 +135,7 @@ Any ground pin on the header works as the common return for driver-board inputs 
 
 **Signal polarity**: every output initializes inactive and drives **active-high** (`gpiozero.DigitalOutputDevice(active_high=True, initial_value=False)`) — GPIO idles at 0 V, goes to 3.3 V when a contactor is commanded closed. Wire driver-board trigger polarity to match.
 
-**Driver board note** (hardware/wiring concern, not software-checkable): the ZX-517-style opto-driver boards used in this project have **no onboard flyback diode**, confirmed by inspection. External flyback protection (1N5404s were used, chosen for headroom over the originally-suggested 1N4007) is required on every inductive coil — cathode to `OUT+`, anode to `OUT-` (reversed polarity is a dead short on power-up). This is the single highest-priority hardware safety item in the whole design: a MOSFET driving a coil without flyback suppression avalanche-stresses on turn-off and typically fails *shorted*, and a shorted K3 driver means leakage injection stuck permanently closed, defeating the pulldowns, the normally-open contactor, and the software 300 ms backstop all at once, with no software remedy once it's happened. ~10 kΩ gate pulldown resistors on each MOSFET input are also required, so a reboot (GPIO reverting to inputs) leaves contactors open rather than floating. All three driver boards' `GND` signal pins must bond to Pi ground at a single star point (the boards aren't optoisolated — MOSFET gates reference supply negative, not Pi ground, without this bond). Never PWM a contactor coil — DC on/off only.
+**Driver board note — known, unaddressed hardware gap** (hardware/wiring concern, not software-checkable): the ZX-517-style opto-driver boards used in this project have **no onboard flyback diode**, confirmed by inspection, **and no external flyback protection has been added** — this remains the single highest-priority hardware gap in the whole design. A MOSFET driving a coil without flyback suppression avalanche-stresses on turn-off and typically fails *shorted*, and a shorted K3 driver means leakage injection stuck permanently closed, defeating the normally-open contactor and the software 300 ms backstop simultaneously, with no software remedy once it's happened. Separately, **no gate pulldown resistors are installed on any MOSFET input**, so a GPIO pin not yet under `gpiozero`'s control (e.g. during early boot) is left floating rather than reliably held low, instead of defaulting the associated contactor open. Both gaps are tracked as future hardware work, not completed mitigations — see `docs/build-and-commissioning-issue-log.md` §9 item 1. If either is added later: flyback diodes go cathode to `OUT+`, anode to `OUT-` per coil (reversed polarity is a dead short on power-up); a typical gate pulldown value for this class of driver board is on the order of 10 kΩ. All three driver boards' `GND` signal pins must bond to Pi ground at a single star point (the boards aren't optoisolated — MOSFET gates reference supply negative, not Pi ground, without this bond). Never PWM a contactor coil — DC on/off only.
 
 ### 1.7 Finding the oscilloscope's VISA resource string
 
@@ -334,7 +334,7 @@ Complete with EVSE mains and all three 12 V contactor supplies off:
 - [ ] K2 is wired as the L2 mains contactor
 - [ ] K3 is wired only as the leakage-injection contactor
 - [ ] K1, K2, K3 driver channels are labeled correctly
-- [ ] Flyback diodes remain connected across all three coils
+- [ ] Known gap acknowledged: no flyback diodes and no gate pulldown resistors are installed on any driver board (§1.6) — inspect for physical driver-board damage accordingly, since this failure mode has no hardware backstop
 - [ ] Probe tip is on the approved measurement node
 - [ ] Scope reference is connected only to the approved reference point
 - [ ] Probe attenuation switch is set to 10x
@@ -658,6 +658,7 @@ Before a 150-cycle or 6,000-cycle campaign, require all of the following, with e
 - [ ] First-cycle zero-time behavior resolved or automatically rejected
 - [ ] Camera framing and classifier validated
 - [ ] Contactors checked after any hardware changes
+- [ ] Flyback-diode/gate-pulldown gap (§1.6) acknowledged for this campaign — still an open future task, not resolved by this checklist
 - [ ] Scope USB cable and port stable; error queue clean
 - [ ] Real supervised validation campaign passed
 - [ ] Real transient-systemd campaign passed without SSH

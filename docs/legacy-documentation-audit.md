@@ -127,19 +127,19 @@ Both were already resolved *for the code* (`camera.device_index` config-driven, 
 
 ### 5.1 Hardware "as-built" reference, traps, and rejected alternatives (from `handoff_latest.md`)
 
-None of this is wrong. None of it is duplicated in `docs/` (which is software-only) or the new runbook (which is a pre-run checklist, not a wiring reference). If `handoff_latest.md` is deleted without capturing this, it's genuinely gone:
+Mostly still accurate, with one correction below the wiring list is now updated to reflect. None of it is duplicated in `docs/` (which is software-only) or the new runbook (which is a pre-run checklist, not a wiring reference). If `handoff_latest.md` is deleted without capturing this, it's genuinely gone:
 
 **Wiring, still accurate:**
 - K1 = L1 mains (GPIO17/pin 11), K2 = L2 mains (GPIO27/pin 13), K3 = leakage injection (GPIO22/pin 15) — three independently-driven single-pole contactors, each via its own ZX-517 dual-MOSFET driver board and its own isolated 12 V 2 A supply.
-- ZX-517 is non-isolated, low-side switching, confirmed **no onboard flyback diode** — all three coils require external 1N4007 flyback diodes, cathode to `OUT+`, anode to `OUT-` (reversed = dead short on power-up). This is the single highest-priority hardware safety item in the original design.
+- ZX-517 is non-isolated, low-side switching, confirmed **no onboard flyback diode** — the original design intent called for external 1N4007 flyback diodes (cathode to `OUT+`, anode to `OUT-`; reversed = dead short on power-up), but **none have actually been installed in the as-built rig** — this remains the single highest-priority hardware gap, open rather than solved (`docs/build-and-commissioning-issue-log.md` §2, §9 item 1).
 - All three driver boards' `GND` signal pins must be bonded to Pi ground at a single star point (the boards are not optoisolated — MOSFET gates reference supply negative, not Pi ground, without this bond).
-- ~10 kΩ gate pulldown resistors on each MOSFET input are required so a reboot (GPIO reverting to inputs) leaves contactors open, not floating.
+- The original design intent also called for ~10 kΩ gate pulldown resistors on each MOSFET input, so a not-yet-initialized GPIO pin defaults to holding the contactor open rather than floating — **these are also not installed**; a future task, not a completed mitigation.
 - Coil spec: 12 VDC nominal, 0.462 A, ~26 Ω expected resistance, operate ≤9 VDC / max 13.2 VDC / release ≥1.2 VDC.
 - Probe: 10:1 passive, 300 V CAT II, tip on one end of the resistor bank, ground clip on ground. (This is the setting directly relevant to the trigger investigation from your last two messages — the original design intent was full-bank measurement, not a midpoint tap.)
 - Scope: Keysight MSO-X 2014A, firmware 02.43.2018020635, USB transport (NI-VISA/PyVISA validated on Windows first, then `pyvisa`+`pyvisa-py`+`pyusb` on the Pi since there's no ARM VISA build).
 
 **Traps worth keeping** (condensed from the original 14-row table — full detail was in `handoff_latest.md` §9):
-1. No flyback diode → avalanche failure → MOSFET usually fails **shorted**, defeating pulldowns/NO-contactor/timeout simultaneously.
+1. No flyback diode → avalanche failure → MOSFET usually fails **shorted**, defeating the NO-contactor/timeout backstops simultaneously. **This trap is not hypothetical here — neither flyback diodes nor gate pulldowns are installed on this rig, so the condition it describes is currently live, not mitigated.**
 2. "Dual MOSFETs in parallel" only halves R_DS(on); it does nothing for inductive kickback.
 3. `:WAVeform:POINts:MODE` defaults to `NORMal` (~1000 pts) regardless of memory depth — must explicitly set `RAW` + `POINts MAXimum`.
 4. `:DIGitize` blanks the display, breaking the screenshot capture — use `:SINGle` instead.
@@ -149,7 +149,7 @@ None of this is wrong. None of it is duplicated in `docs/` (which is software-on
 8. `pyvisa-py`'s USBTMC backend is weak on large binary transfers — this predicted exactly the Entry 3/6 USBTMC wedge/segfault incidents documented in `SCOPE_TRIGGER_DEBUG_LOG.md`.
 9. Scope built-in width/period measurements return one AC half-cycle, not the burst — must compute from the raw envelope offline.
 10. Never PWM the contactor coil — DC on/off only.
-11. Flyback-only suppression slows contactor drop-out 2-3× — harmless here since K3 opening isn't the measurand and the backstop has margin.
+11. Flyback-only suppression slows contactor drop-out 2-3× — would be harmless here since K3 opening isn't the measurand and the backstop has margin, **but doesn't currently apply since no flyback suppression is installed on this rig at all** — worth knowing before adding it as a future task, not evidence it's already accounted for.
 12. NTP time steps can corrupt duration measurements over a multi-day run — all durations must come from `time.monotonic()`, never wall clock.
 13. SD card is a single point of failure — fsync per artifact, commit-then-counter ordering.
 14. `apt upgrade` mid-run can break a running campaign — pinned `requirements.txt` in a venv.
